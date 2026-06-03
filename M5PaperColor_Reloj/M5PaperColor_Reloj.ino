@@ -666,31 +666,6 @@ void drawWeatherLocal(const m5::rtc_datetime_t& dt) {
   g_localPartials = 0; g_lastLocalUpdate = millis();
 }
 
-// Refresco PARCIAL: actualiza solo los campos que cambian (reloj/fecha/temp/hum/bateria).
-void updateLocalPartial(const m5::rtc_datetime_t& dt) {
-  const int W = M5.Display.width();
-  M5.Display.setAutoDisplay(false);
-  if (dt.time.minutes != g_lastMin) {
-    M5.Display.fillRect(20, LOC_CLK_Y - 52, W - 40, 104, WHITE);
-    locClock(M5.Display, dt);
-    M5.Display.display(20, LOC_CLK_Y - 52, W - 40, 104);
-    g_lastMin = dt.time.minutes;
-  }
-  if (dt.date.date != g_lastDay) {
-    M5.Display.fillRect(8, LOC_WD_Y - 26, W - 16, 100, WHITE);
-    locDate(M5.Display, dt);
-    M5.Display.display(8, LOC_WD_Y - 26, W - 16, 100);
-    g_lastDay = dt.date.date;
-  }
-  M5.Display.fillRect(8, LOC_TP_Y - 24, W - 16, 48, WHITE); locTemp(M5.Display);
-  M5.Display.display(8, LOC_TP_Y - 24, W - 16, 48);
-  M5.Display.fillRect(8, LOC_HM_Y - 24, W - 16, 48, WHITE); locHum(M5.Display);
-  M5.Display.display(8, LOC_HM_Y - 24, W - 16, 48);
-  drawBatteryIcon(M5.Display, W - 53, 8); M5.Display.display(W - 56, 4, 56, 28);
-  M5.Display.setAutoDisplay(true);
-  if (++g_localPartials >= 20) g_needRedraw = true;   // limpieza periodica (refresco completo)
-}
-
 void drawWeatherCity(const m5::rtc_datetime_t& dt, int loc) {
   const int W = M5.Display.width(), H = M5.Display.height();
   canvas.fillSprite(WHITE);
@@ -1093,8 +1068,8 @@ void drawLibro() {
 
   if (useBody) canvas.unloadFont();
   // Ayuda discreta abajo
-  canvas.setFont(&fonts::FreeSansBold12pt7b); canvas.setTextColor(BLACK); canvas.setTextDatum(bottom_center);
-  canvas.drawString("UP/DN pasar pag   -   manten G1: lista   -   G1: salir", W / 2, H - 4);
+  canvas.setFont(&fonts::FreeSans9pt7b); canvas.setTextColor(BLACK); canvas.setTextDatum(bottom_center);
+  canvas.drawString("UP/DN pagina   manten G1: lista   G1: salir", W / 2, H - 4);
   canvas.pushSprite(0, 0);
 }
 
@@ -1159,8 +1134,8 @@ void drawLibroList() {
     canvas.drawString(trackName(g_books[idx]), LIB_MARGIN, y);
   }
   if (useBody) canvas.unloadFont();
-  canvas.setFont(&fonts::FreeSansBold12pt7b); canvas.setTextColor(BLACK); canvas.setTextDatum(bottom_center);
-  canvas.drawString("UP/DN elegir   -   x2 abrir   -   G1 salir", W / 2, H - 4);
+  canvas.setFont(&fonts::FreeSans9pt7b); canvas.setTextColor(BLACK); canvas.setTextDatum(bottom_center);
+  canvas.drawString("UP/DN elegir   x2: abrir   G1: salir", W / 2, H - 4);
   canvas.pushSprite(0, 0);
 }
 
@@ -1179,8 +1154,9 @@ void drawCurrentMode() {
 }
 
 void applyEpdMode() {
-  // PRUEBA: todo en epd_fastest (mas rapido, mas ghosting) menos las fotos en calidad
-  M5.Display.setEpdMode(g_mode == MODE_CARRUSEL ? epd_mode_t::epd_quality : epd_mode_t::epd_fastest);
+  // Fotos en calidad; resto en epd_fast (color + razonablemente rapido). El e-paper a color
+  // solo hace refrescos COMPLETOS, asi que minimizamos la FRECUENCIA, no el tamano.
+  M5.Display.setEpdMode(g_mode == MODE_CARRUSEL ? epd_mode_t::epd_quality : epd_mode_t::epd_fast);
 }
 
 // ============================ MODO OCULTO: TV-B-Gone (IR) ============================
@@ -1262,7 +1238,7 @@ void setup() {
   delay(200);
   Serial.println("\n=== M5Paper Color - Estacion multimodo ===");
 
-  M5.Display.setEpdMode(epd_mode_t::epd_fastest);
+  M5.Display.setEpdMode(epd_mode_t::epd_fast);
   setPanelRotation(0);               // UI en vertical (400x600) + crea el lienzo
 
   pinMode(PIN_BTN_MODE, INPUT_PULLUP);
@@ -1331,9 +1307,9 @@ void loop() {
   btnUp.setRawState(ms,   digitalRead(PIN_BTN_UP)   == LOW);
   btnDown.setRawState(ms, digitalRead(PIN_BTN_DOWN) == LOW);
 
-  if (btnMode.wasDoubleClicked()) tvBGone();        // modo oculto: apaga la TV (IR)
-  else if (btnMode.wasHold())     modeLongPress();  // accion del modo (clima: actualizar)
-  else if (btnMode.wasClicked())  changeMode();     // un click: cambia de modo
+  if (btnMode.wasDoubleClicked())      tvBGone();        // doble-click: apaga la TV (IR)
+  else if (btnMode.wasHold())          modeLongPress();  // mantener: accion del modo
+  else if (btnMode.wasSingleClicked()) changeMode();     // 1 click (confirmado): cambia de modo
 
   if (g_mode == MODE_MUSICA) {
     // click=volumen +/-, doble-click=cancion sig/ant, mantener=play/pausa
@@ -1348,12 +1324,12 @@ void loop() {
       // selector: click simple mueve, doble-click abre. (wasSingleClicked evita mover en el
       // primer click de un doble-click, que rompia la deteccion al redibujar la lista.)
       if (btnUp.wasDoubleClicked() || btnDown.wasDoubleClicked()) bookOpenSelected();
-      else if (btnUp.wasSingleClicked())   listMove(-1);
-      else if (btnDown.wasSingleClicked()) listMove(+1);
+      else if (btnUp.wasSingleClicked())   listMove(+1);   // (UP/DOWN invertido a peticion)
+      else if (btnDown.wasSingleClicked()) listMove(-1);
     } else {
-      // lectura: UP/DOWN pasa pagina
-      if (btnUp.wasClicked())   pagePrev();
-      if (btnDown.wasClicked()) pageNext();
+      // lectura: UP/DOWN pasa pagina (invertido)
+      if (btnUp.wasClicked())   pageNext();
+      if (btnDown.wasClicked()) pagePrev();
     }
   } else {
     if (btnUp.wasPressed())   modeUp();      // resto de modos: respuesta inmediata
@@ -1362,13 +1338,14 @@ void loop() {
   // Cualquier toque de boton reinicia el contador de inactividad (para el ahorro)
   if (btnMode.isPressed() || btnUp.isPressed() || btnDown.isPressed()) g_lastInput = ms;
 
-  // Vista LOCAL: refresco PARCIAL cada minuto; tras 5 min sin tocar boton, cada 5 min (ahorro)
+  // Vista LOCAL: 1 refresco COMPLETO cada minuto; tras 5 min sin tocar boton, cada 5 min (ahorro).
+  // (El e-paper a color no hace parcial real: cada display() es un refresco completo del panel.)
   if (g_mode == MODE_CLIMA && g_view == 0 && !g_busy && !g_needRedraw) {
     uint32_t interval = (ms - g_lastInput >= 300000UL) ? 300000UL : 60000UL;
     if (ms - g_lastLocalUpdate >= interval) {
       readSHT40();
-      updateLocalPartial(M5.Rtc.getDateTime());
       g_lastLocalUpdate = ms;
+      g_needRedraw = true;     // un unico refresco completo
     }
   }
 

@@ -265,9 +265,15 @@ pio device monitor  # monitor serie
 - [x] Música (ES8311, MP3/M4A/FLAC, controles iPod Shuffle, acentos VLW)
 - [x] Modo oculto TV-B-Gone (IR + feedback LED)
 - [x] Modo libro **TXT** (selector + paginado + memoria por libro)
+- [x] Refresco LOCAL con cadencia inteligente (1 min; 5 min en reposo)
 - [ ] Modo libro **EPUB** (descompresión ZIP + extracción de texto)
-- [ ] **Refrescos parciales** del e-paper (actualizar solo la zona que cambia: reloj, pasar página)
 - [ ] Modo de bajo consumo (deep sleep)
+
+> ℹ️ **Sobre los refrescos:** el e-paper a color (Spectra 6) solo hace **refrescos completos**
+> (no admite refresco parcial de una región como los e-paper monocromos). Por eso la estrategia es
+> **minimizar la frecuencia**: la vista LOCAL del clima se refresca **una vez por minuto**, y pasa a
+> **una vez cada 5 minutos** si no se toca ningún botón. Las vistas de AEMET solo refrescan al
+> navegar o al actualizar (mantener G1).
 
 ---
 
