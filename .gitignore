@@ -17,6 +17,10 @@ build/
 # Esquematico oficial de M5Stack (no se incluye en el repo)
 *.pdf
 
+# Fuentes .vlw generadas (pueden derivar de fuentes propietarias del sistema;
+# se generan con tools/make_vlw.py y se copian a la SD)
+*.vlw
+
 # Sistema
 Thumbs.db
 .DS_Store

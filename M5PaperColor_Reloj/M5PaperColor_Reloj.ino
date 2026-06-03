@@ -40,6 +40,9 @@
 #include <time.h>
 #include <vector>
 #include "Audio.h"        // ESP32-audioI2S (schreibfaul1) v3.4.6
+#include <IRremoteESP8266.h>
+#include <IRsend.h>
+#include "tvbgone_codes.h"   // base de codigos TV-B-Gone (modo oculto)
 
 // Declaraciones adelantadas (el IDE de Arduino inserta los prototipos auto-
 // generados tras los #include, antes de los struct; esto evita el error).
@@ -75,6 +78,8 @@ String   g_tz = DEF_TZ;
 uint32_t g_carouselMs = 300000;   // 5 min
 String   g_fotosDir  = DEF_FOTOS_DIR;
 String   g_musicaDir = DEF_MUSICA_DIR;
+String   g_librosDir = "/Libros";                // carpeta de libros (modo 4)
+String   g_titleFontPath = "/fonts/title.vlw";   // fuente VLW con acentos para titulos
 bool     g_photoAutoRotate = true;   // girar el panel segun la orientacion de la foto
 
 int numLocs()  { return (int)g_locs.size(); }
@@ -110,11 +115,16 @@ int    g_volume = 12;        // 0..21
 bool   g_playing = false;
 bool   g_loaded = false;     // hay una pista cargada
 bool   g_audioReady = false; // ES8311 + I2S inicializados
-uint32_t g_playStartMs = 0;  // marca de inicio de pista (para detectar fin)
+volatile bool g_trackEnded = false;   // lo pone el callback de la libreria al acabar la pista
+uint8_t* g_titleFont = nullptr;       // buffer del .vlw en memoria (acentos)
+bool     g_titleFontReady = false;
 // Pines de audio (esquematico C151): ES8311 @ I2C interno 0x18, MCLK=BCLK (sin pin MCLK)
 static constexpr int I2S_BCLK_PIN = 40, I2S_LRCK_PIN = 41, I2S_DOUT_PIN = 38;
 static constexpr int PIN_CODEC_EN = 45, PIN_SPK_EN = 46;
 static constexpr uint8_t ES8311_ADDR = 0x18;
+// Emisor IR (modo oculto TV-B-Gone)
+static constexpr int IR_TX_PIN = 48;
+IRsend irsend(IR_TX_PIN);
 
 // Clima
 int g_view = 0;   // 0=LOCAL, 1..N = ciudad (loc = g_view-1)
@@ -138,6 +148,8 @@ void loadDefaults() {
   g_carouselMs = 300000;
   g_fotosDir  = DEF_FOTOS_DIR;
   g_musicaDir = DEF_MUSICA_DIR;
+  g_librosDir = "/Libros";
+  g_titleFontPath = "/fonts/title.vlw";
   g_photoAutoRotate = true;
   g_locs.clear();
   g_locs.push_back({"Madrid",           "28079", "3126Y"});  // obs El Goloso
@@ -166,6 +178,8 @@ bool loadConfig() {
   if (doc["carousel_seconds"].is<int>()) g_carouselMs = (uint32_t)doc["carousel_seconds"] * 1000UL;
   if (doc["fotos_dir"].is<const char*>())  g_fotosDir  = (const char*)doc["fotos_dir"];
   if (doc["musica_dir"].is<const char*>()) g_musicaDir = (const char*)doc["musica_dir"];
+  if (doc["libros_dir"].is<const char*>()) g_librosDir = (const char*)doc["libros_dir"];
+  if (doc["font_title"].is<const char*>()) g_titleFontPath = (const char*)doc["font_title"];
   if (doc["photo_auto_rotate"].is<bool>()) g_photoAutoRotate = doc["photo_auto_rotate"];
   // Ubicaciones
   g_locs.clear();
@@ -222,6 +236,23 @@ void scanImages() {
   loadImageList(g_fotosDir.c_str());
   if (g_images.empty() && g_fotosDir != "/") loadImageList("/");
   Serial.printf("Fotos en %s: %u\n", g_fotosDir.c_str(), (unsigned)g_images.size());
+}
+
+// Carga el .vlw (fuente con acentos) de la SD a un buffer en PSRAM.
+void loadTitleFont() {
+  if (!sd_ready) return;
+  File f = SD.open(g_titleFontPath.c_str());
+  if (!f) { Serial.printf("Sin fuente %s (uso integrada)\n", g_titleFontPath.c_str()); return; }
+  size_t sz = f.size();
+  if (sz == 0 || sz > 1000000UL) { f.close(); return; }
+  g_titleFont = (uint8_t*)ps_malloc(sz);
+  if (!g_titleFont) g_titleFont = (uint8_t*)malloc(sz);
+  if (!g_titleFont) { f.close(); Serial.println("Sin memoria para la fuente"); return; }
+  size_t rd = f.read(g_titleFont, sz);
+  f.close();
+  g_titleFontReady = (rd == sz);
+  Serial.printf("Fuente %s: %s (%u bytes)\n", g_titleFontPath.c_str(),
+                g_titleFontReady ? "OK" : "ERROR", (unsigned)sz);
 }
 
 bool connectWiFi() {
@@ -770,6 +801,28 @@ String trackName(const String& path) {
   if (dot > 0) n = n.substring(0, dot);
   return n;
 }
+// Devuelve el texto en UTF-8 valido (para que la fuente DejaVu pinte los acentos).
+// Si la SD devuelve el nombre en Latin-1 (1 byte por acento), lo expande a UTF-8.
+String utf8Fix(const String& in) {
+  int n = in.length();
+  bool valid = true;
+  for (int i = 0; i < n && valid;) {
+    uint8_t c = in[i];
+    if (c < 0x80) i++;
+    else if ((c & 0xE0) == 0xC0) { valid = (i + 1 < n && (in[i+1] & 0xC0) == 0x80); i += 2; }
+    else if ((c & 0xF0) == 0xE0) { valid = (i + 2 < n && (in[i+1] & 0xC0) == 0x80 && (in[i+2] & 0xC0) == 0x80); i += 3; }
+    else if ((c & 0xF8) == 0xF0) { valid = (i + 3 < n && (in[i+1] & 0xC0) == 0x80 && (in[i+2] & 0xC0) == 0x80 && (in[i+3] & 0xC0) == 0x80); i += 4; }
+    else valid = false;
+  }
+  if (valid) return in;                       // ya es UTF-8
+  String out;                                 // tratar como Latin-1 -> UTF-8
+  for (int i = 0; i < n; i++) {
+    uint8_t c = in[i];
+    if (c < 0x80) out += (char)c;
+    else { out += (char)(0xC0 | (c >> 6)); out += (char)(0x80 | (c & 0x3F)); }
+  }
+  return out;
+}
 
 // Inicializa el codec ES8311 (secuencia M5Unified PaperColor, MCLK=BCLK) y el I2S.
 void audioInit() {
@@ -785,6 +838,8 @@ void audioInit() {
   audio.setPinout(I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN);   // MCLK no necesario (=BCLK)
   audio.setAudioTaskCore(0);     // tarea de audio en el core 0 (Arduino corre en el 1)
   audio.setVolume(g_volume);
+  // Fin de pista fiable via callback de la libreria (evt_eof)
+  Audio::audio_info_callback = [](Audio::msg_t m) { if (m.e == Audio::evt_eof) g_trackEnded = true; };
   g_audioReady = true;
   Serial.println("Audio ES8311 inicializado.");
 }
@@ -795,7 +850,7 @@ void musicPlayCurrent() {
   Serial.printf("[MUSICA] play %s (vol %d)\n", trackName(g_music[g_track]).c_str(), g_volume);
   audio.connecttoFS(SD, g_music[g_track].c_str());
   audio.setVolume(g_volume);
-  g_loaded = true; g_playing = true; g_playStartMs = millis();
+  g_loaded = true; g_playing = true; g_trackEnded = false;
 }
 void musicNext() {
   if (g_music.empty()) return;
@@ -812,7 +867,8 @@ void musicVolUp()   { if (g_volume < 21) g_volume++; if (g_audioReady) audio.set
 void musicVolDown() { if (g_volume > 0)  g_volume--; if (g_audioReady) audio.setVolume(g_volume); Serial.printf("[MUSICA] vol %d\n", g_volume); }
 void musicTogglePlay() {
   if (g_music.empty()) return;
-  if (!g_loaded) { musicPlayCurrent(); g_needRedraw = true; }   // primer play: carga + muestra pista
+  // primer play: la pista actual YA esta en pantalla (se dibujo al entrar al modo) -> no redibujar
+  if (!g_loaded) { musicPlayCurrent(); }
   else { audio.pauseResume(); g_playing = !g_playing; }
   Serial.printf("[MUSICA] %s\n", g_playing ? "play" : "pausa");
 }
@@ -841,20 +897,23 @@ void drawMusic() {
   char idx[16]; snprintf(idx, sizeof(idx), "%u / %u", (unsigned)(g_track + 1), (unsigned)g_music.size());
   canvas.drawString(idx, W - 12, 50);
 
-  // Nombre de la pista (grande, centrado, hasta 2 lineas). Sin icono ni barra:
-  // asi solo refrescamos la pantalla al cambiar de cancion (no al tocar volumen).
-  canvas.setFont(&fonts::FreeSansBold24pt7b); canvas.setTextColor(BLACK); canvas.setTextDatum(middle_center);
+  // Nombre de la pista (grande, centrado, hasta 2 lineas). Fuente VLW con acentos si la hay
+  // (cargada de la SD); si no, DejaVu24 integrada. Sin icono ni barra -> solo refresca al cambiar.
+  bool useVlw = g_titleFontReady && canvas.loadFont(g_titleFont);
+  if (!useVlw) canvas.setFont(&fonts::DejaVu24);
+  canvas.setTextColor(BLACK); canvas.setTextDatum(middle_center);
   {
-    String name = trackName(g_music[g_track]);
+    String name = utf8Fix(trackName(g_music[g_track]));
     if (canvas.textWidth(name) <= W - 24) {
       canvas.drawString(name, W / 2, H / 2);
     } else {
       int half = name.length() / 2;
       int sp = name.indexOf(' ', half); if (sp < 0) sp = half;
-      canvas.drawString(name.substring(0, sp), W / 2, H / 2 - 26);
-      canvas.drawString(name.substring(sp + 1), W / 2, H / 2 + 26);
+      canvas.drawString(name.substring(0, sp), W / 2, H / 2 - 28);
+      canvas.drawString(name.substring(sp + 1), W / 2, H / 2 + 28);
     }
   }
+  if (useVlw) canvas.unloadFont();   // vuelve a fuente por defecto para el resto
 
   // Ayuda de controles (2 lineas para que no se corte)
   canvas.setFont(&fonts::FreeSansBold12pt7b); canvas.setTextColor(BLACK); canvas.setTextDatum(bottom_center);
@@ -880,6 +939,42 @@ void drawCurrentMode() {
 
 void applyEpdMode() {
   M5.Display.setEpdMode(g_mode == MODE_CARRUSEL ? epd_mode_t::epd_quality : epd_mode_t::epd_fast);
+}
+
+// ============================ MODO OCULTO: TV-B-Gone (IR) ============================
+// Parpadeo del LED RGB integrado (sin tocar la pantalla).
+void ledBlink(uint8_t r, uint8_t g, uint8_t b, int times) {
+  if (!M5.Led.isEnabled()) return;
+  M5.Led.setBrightness(120);
+  for (int i = 0; i < times; i++) {
+    M5.Led.setAllColor(r, g, b); delay(180);
+    M5.Led.setAllColor(0, 0, 0); delay(150);
+  }
+}
+
+// Doble-click en G1: emite la tanda de codigos de apagado de TVs europeas.
+// NO usa la pantalla: 2 parpadeos verdes al empezar, rojos al terminar.
+void tvBGone() {
+  ledBlink(0, 255, 0, 2);                   // verde: empezando
+  bool cancel = false;
+  for (int i = 0; i < numCodigosEU; i++) {
+    if (digitalRead(PIN_BTN_MODE) == LOW) { cancel = true; break; }   // G1 cancela
+    const TVCode& c = codigosEU[i];
+    switch (c.proto) {
+      case P_NEC:       irsend.sendNEC(c.code, c.bits);         break;
+      case P_SAMSUNG:   irsend.sendSAMSUNG(c.code, c.bits);     break;
+      case P_SONY12:    irsend.sendSony(c.code, 12, 2);         break;
+      case P_SONY15:    irsend.sendSony(c.code, 15, 2);         break;
+      case P_SONY20:    irsend.sendSony(c.code, 20, 2);         break;
+      case P_RC5:       irsend.sendRC5(c.code, c.bits);         break;
+      case P_RC6:       irsend.sendRC6(c.code, c.bits);         break;
+      case P_PANASONIC: irsend.sendPanasonic64(c.code, c.bits); break;
+      case P_JVC:       irsend.sendJVC(c.code, c.bits, 1);      break;
+    }
+    delay(75);
+  }
+  ledBlink(255, 0, 0, cancel ? 3 : 2);      // rojo: terminado (3 parpadeos si se cancelo)
+  M5.Led.setAllColor(0, 0, 0);              // apagar LED
 }
 
 // ============================ CONTROL DE MODOS ============================
@@ -952,7 +1047,9 @@ void setup() {
   g_clima.assign(numLocs(), ClimaCache{});
   scanImages();                          // lista fotos de la carpeta configurada (/Fotos)
   scanMusic();                           // lista canciones de /Musica
+  loadTitleFont();                       // fuente VLW con acentos (SD)
   audioInit();                           // codec ES8311 + I2S
+  irsend.begin();                        // emisor IR (modo oculto TV-B-Gone)
 
   // Arranque online: NTP + prediccion + observacion (se ve "Iniciando..." mientras tanto)
   fetchAllOnline(true);
@@ -979,8 +1076,9 @@ void loop() {
   btnUp.setRawState(ms,   digitalRead(PIN_BTN_UP)   == LOW);
   btnDown.setRawState(ms, digitalRead(PIN_BTN_DOWN) == LOW);
 
-  if (btnMode.wasDoubleClicked()) changeMode();
-  else if (btnMode.wasHold())     modeLongPress();
+  if (btnMode.wasDoubleClicked()) tvBGone();        // modo oculto: apaga la TV (IR)
+  else if (btnMode.wasHold())     modeLongPress();  // accion del modo (clima: actualizar)
+  else if (btnMode.wasClicked())  changeMode();     // un click: cambia de modo
 
   if (g_mode == MODE_MUSICA) {
     // click=volumen +/-, doble-click=cancion sig/ant, mantener=play/pausa
@@ -1009,10 +1107,8 @@ void loop() {
     g_needRedraw = true;
   }
 
-  // Fin de pista -> siguiente (con margen para evitar falso disparo al arrancar)
-  if (g_playing && g_loaded && g_audioReady && (ms - g_playStartMs > 1500) && !audio.isRunning()) {
-    musicNext();
-  }
+  // Fin de pista -> siguiente (lo marca el callback evt_eof de la libreria)
+  if (g_trackEnded) { g_trackEnded = false; if (g_playing) musicNext(); }
 
   if (g_needRedraw && !g_busy) { g_needRedraw = false; drawCurrentMode(); }
 
