@@ -1,0 +1,23 @@
+# Datos de sesion / memoria de Claude
+.claude/
+
+# Artefactos de Python (ensurepip) creados accidentalmente en la carpeta
+Lib/
+Scripts/
+__pycache__/
+*.pyc
+
+# Artefactos de compilacion de Arduino / PlatformIO
+build/
+*.bin
+*.elf
+*.hex
+.pio/
+
+# Esquematico oficial de M5Stack (no se incluye en el repo)
+*.pdf
+
+# Sistema
+Thumbs.db
+.DS_Store
+desktop.ini

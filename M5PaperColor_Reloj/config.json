@@ -1,0 +1,25 @@
+{
+  "_comentario": "Copia este archivo a la RAIZ de la microSD como /config.json. Las fotos van en /Fotos y la musica en /Musica.",
+
+  "wifi": [
+    { "ssid": "TU_RED_WIFI",  "pass": "TU_CONTRASENA" },
+    { "ssid": "OTRA_RED",     "pass": "OTRA_CONTRASENA" }
+  ],
+
+  "aemet_api_key": "PEGA_AQUI_TU_TOKEN_AEMET",
+
+  "timezone": "CET-1CEST,M3.5.0,M10.5.0/3",
+
+  "carousel_seconds": 300,
+
+  "fotos_dir": "/Fotos",
+  "musica_dir": "/Musica",
+
+  "photo_auto_rotate": true,
+
+  "locations": [
+    { "name": "Madrid",           "municipio": "28079", "estacion": "3126Y" },
+    { "name": "San Ildefonso",    "municipio": "40181", "estacion": "" },
+    { "name": "Posada de Llanes", "municipio": "33036", "estacion": "" }
+  ]
+}

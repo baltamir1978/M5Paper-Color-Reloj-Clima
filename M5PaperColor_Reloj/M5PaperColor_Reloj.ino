@@ -1,0 +1,762 @@
+/*
+ * ============================================================================
+ *  M5Paper Color (ESP32-S3) - Estacion multimodo
+ * ============================================================================
+ *  4 modos (boton G1 doble-click):
+ *    1 CLIMA   : vistas Up/Down -> LOCAL (fecha/hora + sensor) + ciudades AEMET
+ *    2 CARRUSEL: fotos de la microSD a pantalla completa
+ *    3 MUSICA  : (en construccion) MP3 de la SD
+ *    4 LIBRO   : (en construccion) TXT/EPUB
+ *
+ *  TODA la configuracion va en /config.json de la microSD (ver ejemplo en el
+ *  repo). Si falta la SD o el archivo, se usan los valores por defecto de abajo.
+ *
+ *  BOTONES (GPIO, activos a nivel bajo):
+ *    G1=GPIO1 (top): doble-click=modo | mantener=accion (CLIMA: actualizar WiFi)
+ *    UP=GPIO9 / DOWN=GPIO10: navegacion del modo
+ *
+ *  HARDWARE: SHT40 0x44 / RTC RX8130CE 0x32 / PMIC M5PM1 0x6E (I2C SDA=3 SCL=2)
+ *    SPI e-paper+SD: MOSI=13 MISO=14 SCK=15; EINK_DC=43 CS=44; SD_CS=47
+ *    SD/e-paper en rail L3B del PMIC -> habilitar LDO antes de SD.begin
+ *  Librerias: M5Unified, M5GFX, M5UnitENV, M5PM1, ArduinoJson
+ *  Arduino IDE: "ESP32S3 Dev Module", Flash 16MB, PSRAM "OPI PSRAM", USB CDC On.
+ * ============================================================================
+ */
+
+#include <Arduino.h>
+#include <M5GFX.h>
+#include <M5Unified.h>
+#include <M5UnitENV.h>
+#include <M5PM1.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <esp_sntp.h>
+#include <sntp.h>
+#include <SPI.h>
+#include <SD.h>
+#include <Preferences.h>
+#include <time.h>
+#include <vector>
+
+// Declaraciones adelantadas (el IDE de Arduino inserta los prototipos auto-
+// generados tras los #include, antes de los struct; esto evita el error).
+struct WifiCred; struct Location; struct ClimaDay; struct ClimaCache;
+
+// ============================ VALORES POR DEFECTO ============================
+// Solo se usan si no se puede leer /config.json de la SD.
+#define DEF_TZ "CET-1CEST,M3.5.0,M10.5.0/3"   // Espana peninsular (verano: ult.dom marzo -> ult.dom octubre)
+#define NTP_SERVER1 "0.pool.ntp.org"
+#define NTP_SERVER2 "1.pool.ntp.org"
+
+static constexpr uint32_t SHT_UPDATE_MS    = 120000;   // sensor cada 2 min
+static constexpr uint32_t WIFI_PER_NET_MS  = 8000;     // espera por cada red
+static constexpr uint32_t SNTP_TIMEOUT_MS  = 20000;
+
+// Botones
+static constexpr int PIN_BTN_MODE = 1, PIN_BTN_UP = 9, PIN_BTN_DOWN = 10;
+// Pines I2C/SPI
+static constexpr int SHT_SDA_PIN = 3, SHT_SCL_PIN = 2;
+static constexpr int SD_SCK_PIN = 15, SD_MISO_PIN = 14, SD_MOSI_PIN = 13, SD_CS_PIN = 47;
+#define CONFIG_PATH "/config.json"
+#define DEF_FOTOS_DIR  "/Fotos"
+#define DEF_MUSICA_DIR "/Musica"
+
+// ============================ CONFIG (cargada de la SD) ============================
+struct WifiCred { String ssid, pass; };
+struct Location { String name, municipio, estacion; };   // estacion = idema obs (o "")
+
+std::vector<WifiCred> g_wifi;
+std::vector<Location> g_locs;
+String   g_apiKey;
+String   g_tz = DEF_TZ;
+uint32_t g_carouselMs = 300000;   // 5 min
+String   g_fotosDir  = DEF_FOTOS_DIR;
+String   g_musicaDir = DEF_MUSICA_DIR;
+bool     g_photoAutoRotate = true;   // girar el panel segun la orientacion de la foto
+
+int numLocs()  { return (int)g_locs.size(); }
+int numViews() { return numLocs() + 1; }   // vista 0 = LOCAL
+
+// ============================ ESTADO GLOBAL ============================
+enum Mode { MODE_CLIMA = 0, MODE_CARRUSEL, MODE_MUSICA, MODE_LIBRO, MODE_COUNT };
+const char* MODE_NAMES[] = {"CLIMA", "CARRUSEL", "MUSICA", "LIBRO"};
+
+M5Canvas   canvas(&M5.Display);
+M5PM1      pm1;
+SHT4X      sht4;
+Preferences prefs;
+m5::Button_Class btnMode, btnUp, btnDown;
+
+Mode  g_mode = MODE_CLIMA;
+bool  g_needRedraw = true, g_busy = false;
+float g_temp = NAN, g_hum = NAN;
+bool  sht_ready = false, sd_ready = false;
+uint32_t last_sht_ms = 0;
+
+// Carrusel
+std::vector<String> g_images;
+size_t g_img_idx = 0;
+uint32_t last_carousel_ms = 0;
+int g_rot = -1;   // rotacion actual del panel (1=apaisado, 0=vertical)
+
+// Clima
+int g_view = 0;   // 0=LOCAL, 1..N = ciudad (loc = g_view-1)
+struct ClimaDay { char fecha[12]; int wday, tMax, tMin, probLluvia, humMax, humMin; char cielo[40]; };
+struct ClimaCache {
+  ClimaDay day[7]; int nDays; bool valid; int updH, updM;
+  bool obsValid; float obsTemp, obsHum; char obsTime[6];
+};
+std::vector<ClimaCache> g_clima;
+
+const char* DIAS_C[] = {"Dom","Lun","Mar","Mie","Jue","Vie","Sab"};
+const char* DIAS[]   = {"Domingo","Lunes","Martes","Miercoles","Jueves","Viernes","Sabado"};
+const char* MESES[]  = {"Enero","Febrero","Marzo","Abril","Mayo","Junio",
+                        "Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"};
+
+// ============================ CONFIG: cargar / defaults ============================
+void loadDefaults() {
+  g_wifi.clear();   g_wifi.push_back({"TU_RED_WIFI", "TU_CONTRASENA"});
+  g_apiKey = "";
+  g_tz = DEF_TZ;
+  g_carouselMs = 300000;
+  g_fotosDir  = DEF_FOTOS_DIR;
+  g_musicaDir = DEF_MUSICA_DIR;
+  g_photoAutoRotate = true;
+  g_locs.clear();
+  g_locs.push_back({"Madrid",           "28079", "3126Y"});  // obs El Goloso
+  g_locs.push_back({"San Ildefonso",    "40181", ""});
+  g_locs.push_back({"Posada de Llanes", "33036", ""});
+}
+
+bool loadConfig() {
+  if (!sd_ready) return false;
+  File f = SD.open(CONFIG_PATH);
+  if (!f) { Serial.println("No hay /config.json (uso defaults)."); return false; }
+  JsonDocument doc;
+  DeserializationError e = deserializeJson(doc, f);
+  f.close();
+  if (e) { Serial.printf("config.json error: %s (uso defaults)\n", e.c_str()); return false; }
+
+  // WiFi
+  g_wifi.clear();
+  for (JsonObject w : doc["wifi"].as<JsonArray>()) {
+    WifiCred c; c.ssid = (const char*)(w["ssid"] | ""); c.pass = (const char*)(w["pass"] | "");
+    if (c.ssid.length()) g_wifi.push_back(c);
+  }
+  // Clave AEMET + ajustes
+  g_apiKey = (const char*)(doc["aemet_api_key"] | "");
+  if (doc["timezone"].is<const char*>()) g_tz = (const char*)doc["timezone"];
+  if (doc["carousel_seconds"].is<int>()) g_carouselMs = (uint32_t)doc["carousel_seconds"] * 1000UL;
+  if (doc["fotos_dir"].is<const char*>())  g_fotosDir  = (const char*)doc["fotos_dir"];
+  if (doc["musica_dir"].is<const char*>()) g_musicaDir = (const char*)doc["musica_dir"];
+  if (doc["photo_auto_rotate"].is<bool>()) g_photoAutoRotate = doc["photo_auto_rotate"];
+  // Ubicaciones
+  g_locs.clear();
+  for (JsonObject l : doc["locations"].as<JsonArray>()) {
+    Location loc;
+    loc.name = (const char*)(l["name"] | "");
+    loc.municipio = (const char*)(l["municipio"] | "");
+    loc.estacion = (const char*)(l["estacion"] | "");
+    if (loc.name.length()) g_locs.push_back(loc);
+  }
+  // Respaldos por si vienen vacios
+  if (g_wifi.empty() || g_locs.empty()) {
+    Serial.println("config.json incompleto; completo con defaults.");
+    if (g_wifi.empty()) g_wifi.push_back({"TU_RED_WIFI", "TU_CONTRASENA"});
+    if (g_locs.empty()) { g_locs.push_back({"Madrid","28079","3126Y"}); }
+  }
+  Serial.printf("config.json OK: %u redes, %u ubicaciones, key=%s\n",
+                (unsigned)g_wifi.size(), (unsigned)g_locs.size(),
+                g_apiKey.length() ? "si" : "no");
+  return true;
+}
+
+// ============================ SENSOR / SD / RED ============================
+bool initSHT40() {
+  i2c_port_t p = M5.In_I2C.getPort();
+  TwoWire* w = (p == I2C_NUM_1) ? &Wire1 : &Wire;
+  return sht4.begin(w, SHT40_I2C_ADDR_44, SHT_SDA_PIN, SHT_SCL_PIN, 400000U);
+}
+void readSHT40() { if (sht_ready && sht4.update()) { g_temp = sht4.cTemp; g_hum = sht4.humidity; } }
+
+bool isImageFile(const String& n0) {
+  String n = n0; n.toLowerCase();
+  return n.endsWith(".jpg")||n.endsWith(".jpeg")||n.endsWith(".png")||n.endsWith(".bmp");
+}
+void loadImageList(const char* dirpath) {
+  g_images.clear();
+  File dir = SD.open(dirpath);
+  if (!dir || !dir.isDirectory()) { if (dir) dir.close(); return; }
+  for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+    if (!f.isDirectory() && isImageFile(f.path())) g_images.push_back(f.path());
+    f.close();
+  }
+  dir.close();
+}
+bool initSD() {
+  SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+  if (!SD.begin(SD_CS_PIN, SPI, 20000000)) { Serial.println("microSD no detectada."); return false; }
+  Serial.println("microSD montada.");
+  return true;
+}
+// Escanea las fotos de la carpeta configurada (con respaldo a la raiz).
+void scanImages() {
+  if (!sd_ready) return;
+  loadImageList(g_fotosDir.c_str());
+  if (g_images.empty() && g_fotosDir != "/") loadImageList("/");
+  Serial.printf("Fotos en %s: %u\n", g_fotosDir.c_str(), (unsigned)g_images.size());
+}
+
+bool connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return true;
+  WiFi.mode(WIFI_STA);
+  for (auto& c : g_wifi) {
+    Serial.printf("WiFi: probando '%s'...\n", c.ssid.c_str());
+    WiFi.begin(c.ssid.c_str(), c.pass.c_str());
+    uint32_t t0 = millis();
+    while (WiFi.status() != WL_CONNECTED) {
+      if (millis() - t0 >= WIFI_PER_NET_MS) break;
+      delay(200);
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("WiFi OK (%s): %s\n", c.ssid.c_str(), WiFi.localIP().toString().c_str());
+      return true;
+    }
+    WiFi.disconnect();
+  }
+  Serial.println("No se pudo conectar a ninguna red.");
+  return false;
+}
+void wifiOff() { WiFi.disconnect(true); WiFi.mode(WIFI_OFF); }
+
+bool syncRtcFromSntp() {
+  configTzTime(g_tz.c_str(), NTP_SERVER1, NTP_SERVER2);
+  uint32_t t0 = millis();
+  while (sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED) {
+    if (millis() - t0 >= SNTP_TIMEOUT_MS) return false;
+    delay(400);
+  }
+  time_t now = time(nullptr) + 1;
+  while (now > time(nullptr)) delay(10);
+  struct tm* lt = localtime(&now);
+  if (!lt) return false;
+  M5.Rtc.setDateTime(lt);
+  Serial.printf("RTC sincronizado por NTP -> %02d:%02d:%02d (TZ=%s)\n",
+                lt->tm_hour, lt->tm_min, lt->tm_sec, g_tz.c_str());
+  return true;
+}
+
+int wdayFromFecha(const char* f) {
+  struct tm t = {}; int y, m, d;
+  if (sscanf(f, "%d-%d-%d", &y, &m, &d) != 3) return 0;
+  t.tm_year = y - 1900; t.tm_mon = m - 1; t.tm_mday = d; t.tm_hour = 12;
+  time_t tt = mktime(&t);
+  struct tm* r = localtime(&tt);
+  return r ? r->tm_wday : 0;
+}
+
+// --- Helpers de mensaje (usados por fetchAllOnline y los modos) ---
+void drawCenteredMsg(const char* msg, int y, uint16_t color = BLACK,
+                     const lgfx::IFont* font = &fonts::FreeSansBold18pt7b) {
+  canvas.setFont(font);
+  canvas.setTextDatum(middle_center);
+  canvas.setTextColor(color);
+  canvas.drawString(msg, M5.Display.width() / 2, y);
+}
+void showBusy(const char* msg) {
+  g_busy = true;
+  canvas.fillSprite(WHITE);
+  drawCenteredMsg(msg, M5.Display.height() / 2);
+  canvas.pushSprite(0, 0);
+}
+void showHelperBusyFail() { showBusy("Sin WiFi"); delay(1200); }
+
+// ============================ AEMET ============================
+bool aemetFetch(int idx) {
+  if (g_apiKey.length() == 0) return false;
+  String url = String("https://opendata.aemet.es/opendata/api/prediccion/especifica/municipio/diaria/")
+             + g_locs[idx].municipio + "?api_key=" + g_apiKey;
+  WiFiClientSecure c1; c1.setInsecure();
+  HTTPClient h1;
+  if (!h1.begin(c1, url)) return false;
+  int code = h1.GET();
+  if (code != 200) { Serial.printf("AEMET paso1 HTTP %d\n", code); h1.end(); return false; }
+  JsonDocument meta; deserializeJson(meta, h1.getStream()); h1.end();
+  String datos = meta["datos"] | "";
+  if (datos.isEmpty()) return false;
+
+  WiFiClientSecure c2; c2.setInsecure();
+  HTTPClient h2;
+  if (!h2.begin(c2, datos)) return false;
+  if (h2.GET() != 200) { h2.end(); return false; }
+
+  JsonDocument filter;
+  JsonObject dia = filter[0]["prediccion"]["dia"][0].to<JsonObject>();
+  dia["fecha"] = true;
+  dia["temperatura"]["maxima"] = true;
+  dia["temperatura"]["minima"] = true;
+  dia["humedadRelativa"]["maxima"] = true;
+  dia["humedadRelativa"]["minima"] = true;
+  dia["estadoCielo"][0]["descripcion"] = true;
+  dia["estadoCielo"][0]["periodo"] = true;
+  dia["probPrecipitacion"][0]["value"] = true;
+  dia["probPrecipitacion"][0]["periodo"] = true;
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, h2.getStream(), DeserializationOption::Filter(filter));
+  h2.end();
+  if (err) { Serial.printf("AEMET JSON err: %s\n", err.c_str()); return false; }
+
+  JsonArray dias = doc[0]["prediccion"]["dia"].as<JsonArray>();
+  ClimaCache& cc = g_clima[idx];
+  cc.nDays = 0;
+  for (JsonObject day : dias) {
+    if (cc.nDays >= 7) break;
+    ClimaDay& cd = cc.day[cc.nDays];
+    strlcpy(cd.fecha, day["fecha"] | "", sizeof(cd.fecha));
+    cd.wday = wdayFromFecha(cd.fecha);
+    cd.tMax = day["temperatura"]["maxima"] | -99;
+    cd.tMin = day["temperatura"]["minima"] | -99;
+    cd.humMax = day["humedadRelativa"]["maxima"] | -1;
+    cd.humMin = day["humedadRelativa"]["minima"] | -1;
+    cd.cielo[0] = 0; cd.probLluvia = 0;
+    for (JsonObject e : day["estadoCielo"].as<JsonArray>()) {
+      const char* per = e["periodo"] | ""; const char* des = e["descripcion"] | "";
+      if (strlen(des) && (strcmp(per, "00-24") == 0 || cd.cielo[0] == 0))
+        strlcpy(cd.cielo, des, sizeof(cd.cielo));
+    }
+    for (JsonObject p : day["probPrecipitacion"].as<JsonArray>()) {
+      const char* per = p["periodo"] | "";
+      if (strcmp(per, "00-24") == 0) { cd.probLluvia = p["value"] | 0; break; }
+      cd.probLluvia = p["value"] | cd.probLluvia;
+    }
+    cc.nDays++;
+  }
+  auto dt = M5.Rtc.getDateTime();
+  cc.updH = dt.time.hours; cc.updM = dt.time.minutes;
+  cc.valid = cc.nDays > 0;
+  Serial.printf("AEMET %s: %d dias\n", g_locs[idx].name.c_str(), cc.nDays);
+  return cc.valid;
+}
+
+bool aemetFetchObs(int idx) {
+  if (g_apiKey.length() == 0 || g_locs[idx].estacion.length() == 0) return false;
+  String url = String("https://opendata.aemet.es/opendata/api/observacion/convencional/datos/estacion/")
+             + g_locs[idx].estacion + "?api_key=" + g_apiKey;
+  WiFiClientSecure c1; c1.setInsecure();
+  HTTPClient h1;
+  if (!h1.begin(c1, url)) return false;
+  if (h1.GET() != 200) { h1.end(); return false; }
+  JsonDocument meta; deserializeJson(meta, h1.getStream()); h1.end();
+  String datos = meta["datos"] | "";
+  if (datos.isEmpty()) return false;
+
+  WiFiClientSecure c2; c2.setInsecure();
+  HTTPClient h2;
+  if (!h2.begin(c2, datos)) return false;
+  if (h2.GET() != 200) { h2.end(); return false; }
+
+  JsonDocument filter;
+  JsonObject o = filter[0].to<JsonObject>();
+  o["fint"] = true; o["ta"] = true; o["hr"] = true;
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, h2.getStream(), DeserializationOption::Filter(filter));
+  h2.end();
+  if (err) { Serial.printf("OBS JSON err: %s\n", err.c_str()); return false; }
+
+  ClimaCache& cc = g_clima[idx];
+  cc.obsValid = false;
+  for (JsonObject ob : doc.as<JsonArray>()) {     // ordenado ascendente: nos quedamos el ultimo valido
+    if (ob["ta"].is<float>()) {
+      cc.obsTemp = ob["ta"] | NAN;
+      cc.obsHum  = ob["hr"] | NAN;
+      const char* fint = ob["fint"] | "";
+      if (strlen(fint) >= 16) strlcpy(cc.obsTime, fint + 11, sizeof(cc.obsTime));
+      else cc.obsTime[0] = 0;
+      cc.obsValid = true;
+    }
+  }
+  Serial.printf("OBS %s: %.1fC %.0f%% @%s\n", g_locs[idx].name.c_str(), cc.obsTemp, cc.obsHum, cc.obsTime);
+  return cc.obsValid;
+}
+
+// Descarga (NTP + prediccion + observacion) de todas las ubicaciones.
+void fetchAllOnline(bool withNtp) {
+  if (!connectWiFi()) { showHelperBusyFail(); return; }
+  if (withNtp) syncRtcFromSntp();
+  if (g_apiKey.length() > 0) {
+    for (int i = 0; i < numLocs(); i++) {   // sin refrescos por ciudad (el e-paper es lento)
+      Serial.printf("Descargando %s...\n", g_locs[i].name.c_str());
+      aemetFetch(i);
+      aemetFetchObs(i);
+    }
+  }
+  wifiOff();
+}
+
+// ============================ DIBUJO ============================
+// Prediccion compacta como FILAS de dia (hasta 7): dia + cielo + humedad a la izquierda,
+// max/min y lluvia a la derecha. Aprovecha el alto del modo vertical.
+void drawForecastCards(ClimaCache& cc, int top, int bottom) {
+  const int W = M5.Display.width();
+  int n = cc.nDays; if (n <= 0) return;
+  int rowH = (bottom - top) / n;
+  for (int i = 0; i < n; i++) {
+    int y0 = top + i * rowH;
+    if (i > 0) canvas.drawFastHLine(10, y0, W - 20, BLACK);
+    ClimaDay& d = cc.day[i];
+
+    // Izquierda: dia (grande) + cielo + humedad
+    canvas.setTextDatum(top_left);
+    canvas.setFont(&fonts::FreeSansBold18pt7b); canvas.setTextColor(BLACK);
+    canvas.drawString(DIAS_C[d.wday], 12, y0 + 4);
+    canvas.setFont(&fonts::FreeSansBold12pt7b); canvas.setTextColor(BLACK);
+    char cielo[26]; strlcpy(cielo, d.cielo, sizeof(cielo));
+    canvas.drawString(cielo, 12, y0 + 34);
+    if (d.humMax >= 0) {
+      char hr[20]; snprintf(hr, sizeof(hr), "HR %d-%d%%", d.humMin, d.humMax);
+      canvas.setTextColor(BLUE); canvas.drawString(hr, 12, y0 + 54);
+    }
+
+    // Derecha: max/min (rojo/azul) y lluvia
+    canvas.setFont(&fonts::FreeSansBold18pt7b);
+    canvas.setTextDatum(top_right);
+    char s[8];
+    snprintf(s, sizeof(s), "%d", d.tMin);
+    canvas.setTextColor(BLUE);  canvas.drawString(s, W - 12, y0 + 4); int wmin = canvas.textWidth(s);
+    canvas.setTextColor(BLACK); canvas.drawString("/", W - 12 - wmin, y0 + 4); int wsl = canvas.textWidth("/");
+    snprintf(s, sizeof(s), "%d", d.tMax);
+    canvas.setTextColor(RED);   canvas.drawString(s, W - 12 - wmin - wsl, y0 + 4);
+
+    canvas.setFont(&fonts::FreeSansBold12pt7b); canvas.setTextColor(BLUE);
+    char lab[16]; snprintf(lab, sizeof(lab), "lluvia %d%%", d.probLluvia);
+    canvas.drawString(lab, W - 12, y0 + 36);
+  }
+}
+
+void drawWeatherLocal(const m5::rtc_datetime_t& dt) {
+  const int W = M5.Display.width(), H = M5.Display.height();
+  canvas.fillSprite(WHITE);
+
+  // Cabecera: titulo + bateria
+  canvas.setFont(&fonts::FreeSansBold18pt7b);
+  canvas.setTextDatum(top_left); canvas.setTextColor(BLACK);
+  char hdr[16]; snprintf(hdr, sizeof(hdr), "LOCAL  1/%d", numViews());
+  canvas.drawString(hdr, 12, 8);
+  int bat = M5.Power.getBatteryLevel();
+  char bs[12]; snprintf(bs, sizeof(bs), (bat < 0) ? "bat --%%" : "bat %d%%", bat);
+  canvas.setTextDatum(top_right); canvas.drawString(bs, W - 12, 8);
+
+  // Hora grande
+  char hm[8]; snprintf(hm, sizeof(hm), "%02d:%02d", dt.time.hours, dt.time.minutes);
+  canvas.setFont(&fonts::Font7); canvas.setTextDatum(middle_center); canvas.setTextColor(BLACK);
+  canvas.drawString(hm, W / 2, 150);
+
+  // Fecha en 2 lineas
+  int wday = (dt.date.weekDay >= 0 && dt.date.weekDay <= 6) ? dt.date.weekDay : 0;
+  int mes  = (dt.date.month >= 1 && dt.date.month <= 12) ? dt.date.month - 1 : 0;
+  canvas.setFont(&fonts::FreeSansBold24pt7b); canvas.setTextColor(BLACK);
+  canvas.drawString(DIAS[wday], W / 2, 250);
+  char d2[40]; snprintf(d2, sizeof(d2), "%d de %s %d", dt.date.date, MESES[mes], dt.date.year);
+  canvas.setFont(&fonts::FreeSansBold18pt7b);
+  canvas.drawString(d2, W / 2, 300);
+
+  canvas.drawFastHLine(40, 345, W - 80, BLACK);
+
+  // Sensor interior (apilado)
+  char b[16];
+  snprintf(b, sizeof(b), isnan(g_temp) ? "--.- C" : "%.1f C", g_temp);
+  canvas.setFont(&fonts::FreeSansBold24pt7b); canvas.setTextColor(RED);  canvas.drawString(b, W / 2, 410);
+  canvas.setFont(&fonts::FreeSansBold18pt7b); canvas.setTextColor(BLACK); canvas.drawString("Temperatura interior", W / 2, 455);
+  snprintf(b, sizeof(b), isnan(g_hum) ? "--.- %%" : "%.0f %%", g_hum);
+  canvas.setFont(&fonts::FreeSansBold24pt7b); canvas.setTextColor(BLUE); canvas.drawString(b, W / 2, 515);
+  canvas.setFont(&fonts::FreeSansBold18pt7b); canvas.setTextColor(BLACK); canvas.drawString("Humedad", W / 2, 560);
+  canvas.pushSprite(0, 0);
+}
+
+void drawWeatherCity(const m5::rtc_datetime_t& dt, int loc) {
+  const int W = M5.Display.width(), H = M5.Display.height();
+  canvas.fillSprite(WHITE);
+  // Cabecera (compacta para 400 px)
+  canvas.setFont(&fonts::FreeSansBold18pt7b);
+  canvas.setTextDatum(top_left); canvas.setTextColor(BLACK);
+  canvas.drawString(g_locs[loc].name.c_str(), 12, 6);
+  canvas.setFont(&fonts::FreeSansBold12pt7b); canvas.setTextDatum(top_right);
+  char hv[16]; snprintf(hv, sizeof(hv), "%02d:%02d  %d/%d", dt.time.hours, dt.time.minutes, loc + 2, numViews());
+  canvas.drawString(hv, W - 12, 10);
+  canvas.drawFastHLine(12, 40, W - 24, BLACK);
+
+  if (g_apiKey.length() == 0) {
+    drawCenteredMsg("Configura aemet_api_key", H / 2 - 20, RED, &fonts::FreeSansBold18pt7b);
+    drawCenteredMsg("en /config.json", H / 2 + 16, RED, &fonts::FreeSansBold18pt7b);
+    canvas.pushSprite(0, 0); return;
+  }
+
+  ClimaCache& cc = g_clima[loc];
+  int cardsTop = 48;
+  if (cc.obsValid) {
+    canvas.setTextDatum(top_left); canvas.setFont(&fonts::FreeSansBold12pt7b); canvas.setTextColor(BLACK);
+    char lbl[24]; snprintf(lbl, sizeof(lbl), "Ahora %s", cc.obsTime);
+    canvas.drawString(lbl, 12, 46);
+    canvas.setTextDatum(top_right); char v[24];
+    snprintf(v, sizeof(v), "%.1fC  %.0f%%", cc.obsTemp, cc.obsHum);
+    canvas.setTextColor(RED); canvas.drawString(v, W - 12, 46);
+    canvas.drawFastHLine(12, 74, W - 24, BLACK);
+    cardsTop = 82;
+  }
+  if (!cc.valid) {
+    drawCenteredMsg("Manten G1 para actualizar", H / 2, BLACK, &fonts::FreeSansBold18pt7b);
+    canvas.pushSprite(0, 0); return;
+  }
+  drawForecastCards(cc, cardsTop, H - 22);
+  canvas.setFont(&fonts::FreeSansBold12pt7b); canvas.setTextColor(BLACK);
+  canvas.setTextDatum(bottom_right);
+  char upd[24]; snprintf(upd, sizeof(upd), "AEMET %02d:%02d", cc.updH, cc.updM);
+  canvas.drawString(upd, W - 8, H - 4);
+  int bat = M5.Power.getBatteryLevel();
+  char bs[12]; snprintf(bs, sizeof(bs), (bat < 0) ? "bat --%%" : "bat %d%%", bat);
+  canvas.setTextDatum(bottom_left); canvas.drawString(bs, 8, H - 4);
+  canvas.pushSprite(0, 0);
+}
+
+// Dibuja una imagen ajustada/centrada. Carga el fichero a un buffer (PSRAM) y usa
+// las variantes drawJpg/drawPng/drawBmp por memoria (evita la plantilla de filesystem
+// de M5GFX, que es abstracta en esta version).
+void drawImageFitted(const String& path, int x, int y, int w, int h) {
+  File f = SD.open(path);
+  if (!f) return;
+  size_t sz = f.size();
+  if (sz == 0) { f.close(); return; }
+  uint8_t* buf = (uint8_t*)ps_malloc(sz);     // preferimos PSRAM
+  if (!buf) buf = (uint8_t*)malloc(sz);
+  if (!buf) { f.close(); Serial.println("Sin memoria para la imagen"); return; }
+  size_t rd = f.read(buf, sz);
+  f.close();
+  if (rd == sz) {
+    String n = path; n.toLowerCase();
+    // (x,y)=esquina de la caja, (w,h)=tamano de la caja, escala 0 -> auto-ajuste,
+    // datum middle_center -> centrado. (Antes pasaba el centro como esquina y se salia.)
+    if (n.endsWith(".png"))      canvas.drawPng(buf, sz, x, y, w, h, 0, 0, 0.0f, 0.0f, middle_center);
+    else if (n.endsWith(".bmp")) canvas.drawBmp(buf, sz, x, y, w, h, 0, 0, 0.0f, 0.0f, middle_center);
+    else                         canvas.drawJpg(buf, sz, x, y, w, h, 0, 0, 0.0f, 0.0f, middle_center);
+  }
+  free(buf);
+}
+
+// Cambia la rotacion del panel y recrea el lienzo al nuevo tamano.
+void setPanelRotation(int rot) {
+  if (rot == g_rot) return;
+  g_rot = rot;
+  M5.Display.setRotation(rot);
+  canvas.deleteSprite();
+  canvas.setPsram(true);
+  canvas.createSprite(M5.Display.width(), M5.Display.height());
+}
+
+// Lee ancho/alto de la imagen desde su cabecera (JPG/PNG/BMP) sin decodificarla.
+bool jpgSize(File& f, int& w, int& h) {
+  if (f.read() != 0xFF || f.read() != 0xD8) return false;          // SOI
+  while (f.available()) {
+    int b = f.read();
+    if (b != 0xFF) continue;
+    int marker = f.read();
+    while (marker == 0xFF) marker = f.read();
+    if (marker >= 0xC0 && marker <= 0xCF && marker != 0xC4 && marker != 0xC8 && marker != 0xCC) {
+      f.read(); f.read();            // longitud
+      f.read();                      // precision
+      h = (f.read() << 8) | f.read();
+      w = (f.read() << 8) | f.read();
+      return true;
+    }
+    int len = (f.read() << 8) | f.read();
+    if (len < 2) return false;
+    f.seek(f.position() + len - 2);
+  }
+  return false;
+}
+bool getImageSize(const String& path, int& w, int& h) {
+  File f = SD.open(path);
+  if (!f) return false;
+  String n = path; n.toLowerCase();
+  bool ok = false;
+  if (n.endsWith(".png")) {
+    uint8_t b[24];
+    if (f.read(b, 24) == 24) {
+      w = (b[16]<<24)|(b[17]<<16)|(b[18]<<8)|b[19];
+      h = (b[20]<<24)|(b[21]<<16)|(b[22]<<8)|b[23]; ok = true;
+    }
+  } else if (n.endsWith(".bmp")) {
+    uint8_t b[26];
+    if (f.read(b, 26) == 26) {
+      w = b[18]|(b[19]<<8)|(b[20]<<16)|(b[21]<<24);
+      int hh = b[22]|(b[23]<<8)|(b[24]<<16)|(b[25]<<24);
+      h = abs(hh); ok = true;
+    }
+  } else {
+    ok = jpgSize(f, w, h);
+  }
+  f.close();
+  return ok && w > 0 && h > 0;
+}
+
+void drawCarrusel() {
+  if (!(sd_ready && !g_images.empty())) {
+    setPanelRotation(1);
+    canvas.fillSprite(WHITE);
+    drawCenteredMsg("Sin imagenes en la microSD", M5.Display.height() / 2);
+    canvas.pushSprite(0, 0);
+    return;
+  }
+  const String& path = g_images[g_img_idx % g_images.size()];
+  // Orientacion del panel segun la foto (vertical -> rot 0, horizontal -> rot 1)
+  int rot = 1, iw = 0, ih = 0;
+  if (g_photoAutoRotate && getImageSize(path, iw, ih) && ih > iw) rot = 0;
+  setPanelRotation(rot);
+
+  const int W = M5.Display.width(), H = M5.Display.height();
+  canvas.fillSprite(WHITE);
+  drawImageFitted(path, 0, 0, W, H);
+  canvas.pushSprite(0, 0);
+}
+void drawConstruccion(const char* titulo, const char* sub) {
+  const int H = M5.Display.height();
+  canvas.fillSprite(WHITE);
+  drawCenteredMsg(titulo, H / 2 - 30, BLACK, &fonts::FreeSansBold24pt7b);
+  drawCenteredMsg(sub, H / 2 + 20, BLACK, &fonts::FreeSansBold18pt7b);
+  canvas.pushSprite(0, 0);
+}
+
+void drawCurrentMode() {
+  auto dt = M5.Rtc.getDateTime();
+  switch (g_mode) {
+    case MODE_CLIMA:
+      if (g_view == 0 || numLocs() == 0) drawWeatherLocal(dt);
+      else                               drawWeatherCity(dt, g_view - 1);
+      break;
+    case MODE_CARRUSEL: drawCarrusel(); break;
+    case MODE_MUSICA:   drawConstruccion("MUSICA", "Reproductor MP3 (en construccion)"); break;
+    case MODE_LIBRO:    drawConstruccion("LIBRO",  "Lector TXT/EPUB (en construccion)"); break;
+    default: break;
+  }
+}
+
+void applyEpdMode() {
+  M5.Display.setEpdMode(g_mode == MODE_CARRUSEL ? epd_mode_t::epd_quality : epd_mode_t::epd_fast);
+}
+
+// ============================ CONTROL DE MODOS ============================
+void changeMode() {
+  g_mode = (Mode)((g_mode + 1) % MODE_COUNT);
+  prefs.putUChar("mode", (uint8_t)g_mode);
+  Serial.printf("-> Modo %s\n", MODE_NAMES[g_mode]);
+  if (g_mode == MODE_CARRUSEL) last_carousel_ms = millis();
+  else setPanelRotation(0);          // el resto de modos en vertical
+  applyEpdMode();
+  g_needRedraw = true;
+}
+void modeLongPress() {
+  if (g_mode == MODE_CLIMA) {
+    showBusy("Actualizando (WiFi)...");
+    fetchAllOnline(true);
+    g_busy = false; g_needRedraw = true;
+  }
+}
+void modeUp() {
+  if (g_mode == MODE_CLIMA) { g_view = (g_view + 1) % numViews(); g_needRedraw = true; }
+  else if (g_mode == MODE_CARRUSEL && !g_images.empty()) {
+    g_img_idx = (g_img_idx + 1) % g_images.size(); last_carousel_ms = millis(); g_needRedraw = true;
+  }
+}
+void modeDown() {
+  if (g_mode == MODE_CLIMA) { g_view = (g_view + numViews() - 1) % numViews(); g_needRedraw = true; }
+  else if (g_mode == MODE_CARRUSEL && !g_images.empty()) {
+    g_img_idx = (g_img_idx + g_images.size() - 1) % g_images.size(); last_carousel_ms = millis(); g_needRedraw = true;
+  }
+}
+
+// ============================ SETUP ============================
+void setup() {
+  auto cfg = M5.config();
+  cfg.clear_display = false;
+  M5.begin(cfg);
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("\n=== M5Paper Color - Estacion multimodo ===");
+
+  M5.Display.setEpdMode(epd_mode_t::epd_fast);
+  setPanelRotation(0);               // UI en vertical (400x600) + crea el lienzo
+
+  pinMode(PIN_BTN_MODE, INPUT_PULLUP);
+  pinMode(PIN_BTN_UP,   INPUT_PULLUP);
+  pinMode(PIN_BTN_DOWN, INPUT_PULLUP);
+  btnMode.setHoldThresh(800);
+
+  showBusy("Iniciando..."); g_busy = false;
+
+  if (pm1.begin(&M5.In_I2C, M5PM1_DEFAULT_ADDR, M5PM1_I2C_FREQ_100K) == M5PM1_OK) {
+    pm1.setLdoEnable(true);
+    Serial.println("M5PM1 OK, LDO habilitado.");
+  } else Serial.println("AVISO: M5PM1 no inicializado.");
+
+  if (!M5.Rtc.isEnabled()) Serial.println("AVISO: RTC no encontrado.");
+
+  sht_ready = initSHT40();
+  if (!sht_ready) Serial.println("AVISO: SHT40 no encontrado.");
+  readSHT40();
+
+  // SD primero, luego configuracion (de la SD), luego dimensionar caches
+  sd_ready = initSD();
+  loadDefaults();
+  loadConfig();                          // sobreescribe defaults si hay /config.json
+  g_clima.assign(numLocs(), ClimaCache{});
+  scanImages();                          // lista fotos de la carpeta configurada (/Fotos)
+
+  // Arranque online: NTP + prediccion + observacion (se ve "Iniciando..." mientras tanto)
+  fetchAllOnline(true);
+  g_busy = false;
+
+  prefs.begin("papercolor", false);
+  g_mode = (Mode)prefs.getUChar("mode", MODE_CLIMA);
+  if (g_mode >= MODE_COUNT) g_mode = MODE_CLIMA;
+  applyEpdMode();
+  Serial.printf("Modo inicial: %s\n", MODE_NAMES[g_mode]);
+
+  last_sht_ms = millis();
+  last_carousel_ms = millis();
+  g_needRedraw = true;
+}
+
+// ============================ LOOP ============================
+void loop() {
+  M5.update();
+
+  uint32_t ms = millis();
+  btnMode.setRawState(ms, digitalRead(PIN_BTN_MODE) == LOW);
+  btnUp.setRawState(ms,   digitalRead(PIN_BTN_UP)   == LOW);
+  btnDown.setRawState(ms, digitalRead(PIN_BTN_DOWN) == LOW);
+
+  if (btnMode.wasDoubleClicked()) changeMode();
+  else if (btnMode.wasHold())     modeLongPress();
+  if (btnUp.wasPressed())   modeUp();      // responde al pulsar (mas agil)
+  if (btnDown.wasPressed()) modeDown();
+
+  // Sensor + refresco de la vista LOCAL: cada 2 min (la pantalla queda fija entre medias)
+  if (ms - last_sht_ms >= SHT_UPDATE_MS) {
+    last_sht_ms = ms;
+    readSHT40();
+    if (g_mode == MODE_CLIMA && g_view == 0) g_needRedraw = true;
+  }
+
+  // Carrusel automatico (infinito: g_img_idx siempre con modulo)
+  if (g_mode == MODE_CARRUSEL && sd_ready && !g_images.empty() && ms - last_carousel_ms >= g_carouselMs) {
+    last_carousel_ms = ms;
+    g_img_idx = (g_img_idx + 1) % g_images.size();
+    g_needRedraw = true;
+  }
+
+  if (g_needRedraw && !g_busy) { g_needRedraw = false; drawCurrentMode(); }
+
+  delay(10);
+}
