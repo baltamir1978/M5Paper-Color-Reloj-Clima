@@ -118,6 +118,18 @@ bool   g_audioReady = false; // ES8311 + I2S inicializados
 volatile bool g_trackEnded = false;   // lo pone el callback de la libreria al acabar la pista
 uint8_t* g_titleFont = nullptr;       // buffer del .vlw en memoria (acentos)
 bool     g_titleFontReady = false;
+
+// Libro (lector TXT)
+std::vector<String> g_books;
+int      g_bookIdx = 0;
+uint32_t g_pageStart = 0, g_nextPageStart = 0;
+std::vector<uint32_t> g_pageStack;    // historial de offsets para "pagina anterior"
+uint8_t* g_bodyFont = nullptr;        // fuente de lectura (mas pequena, con acentos)
+bool     g_bodyFontReady = false;
+String   g_bodyFontPath = "/fonts/body.vlw";
+enum LibState { LIB_LIST, LIB_READING };
+LibState g_libState = LIB_LIST;       // al entrar al modo libro: selector de archivos
+int      g_sel = 0;                   // libro resaltado en el selector
 // Pines de audio (esquematico C151): ES8311 @ I2C interno 0x18, MCLK=BCLK (sin pin MCLK)
 static constexpr int I2S_BCLK_PIN = 40, I2S_LRCK_PIN = 41, I2S_DOUT_PIN = 38;
 static constexpr int PIN_CODEC_EN = 45, PIN_SPK_EN = 46;
@@ -150,6 +162,7 @@ void loadDefaults() {
   g_musicaDir = DEF_MUSICA_DIR;
   g_librosDir = "/Libros";
   g_titleFontPath = "/fonts/title.vlw";
+  g_bodyFontPath  = "/fonts/body.vlw";
   g_photoAutoRotate = true;
   g_locs.clear();
   g_locs.push_back({"Madrid",           "28079", "3126Y"});  // obs El Goloso
@@ -180,6 +193,7 @@ bool loadConfig() {
   if (doc["musica_dir"].is<const char*>()) g_musicaDir = (const char*)doc["musica_dir"];
   if (doc["libros_dir"].is<const char*>()) g_librosDir = (const char*)doc["libros_dir"];
   if (doc["font_title"].is<const char*>()) g_titleFontPath = (const char*)doc["font_title"];
+  if (doc["font_body"].is<const char*>())  g_bodyFontPath  = (const char*)doc["font_body"];
   if (doc["photo_auto_rotate"].is<bool>()) g_photoAutoRotate = doc["photo_auto_rotate"];
   // Ubicaciones
   g_locs.clear();
@@ -238,21 +252,42 @@ void scanImages() {
   Serial.printf("Fotos en %s: %u\n", g_fotosDir.c_str(), (unsigned)g_images.size());
 }
 
-// Carga el .vlw (fuente con acentos) de la SD a un buffer en PSRAM.
-void loadTitleFont() {
-  if (!sd_ready) return;
-  File f = SD.open(g_titleFontPath.c_str());
-  if (!f) { Serial.printf("Sin fuente %s (uso integrada)\n", g_titleFontPath.c_str()); return; }
+// Carga un .vlw (fuente con acentos) de la SD a un buffer en PSRAM. Devuelve el buffer o null.
+uint8_t* loadVlwFile(const String& path) {
+  if (!sd_ready) return nullptr;
+  File f = SD.open(path.c_str());
+  if (!f) { Serial.printf("Sin fuente %s (uso integrada)\n", path.c_str()); return nullptr; }
   size_t sz = f.size();
-  if (sz == 0 || sz > 1000000UL) { f.close(); return; }
-  g_titleFont = (uint8_t*)ps_malloc(sz);
-  if (!g_titleFont) g_titleFont = (uint8_t*)malloc(sz);
-  if (!g_titleFont) { f.close(); Serial.println("Sin memoria para la fuente"); return; }
-  size_t rd = f.read(g_titleFont, sz);
+  if (sz == 0 || sz > 1000000UL) { f.close(); return nullptr; }
+  uint8_t* buf = (uint8_t*)ps_malloc(sz);
+  if (!buf) buf = (uint8_t*)malloc(sz);
+  if (!buf) { f.close(); Serial.println("Sin memoria para la fuente"); return nullptr; }
+  size_t rd = f.read(buf, sz);
   f.close();
-  g_titleFontReady = (rd == sz);
-  Serial.printf("Fuente %s: %s (%u bytes)\n", g_titleFontPath.c_str(),
-                g_titleFontReady ? "OK" : "ERROR", (unsigned)sz);
+  Serial.printf("Fuente %s: %s (%u bytes)\n", path.c_str(), (rd == sz) ? "OK" : "ERROR", (unsigned)sz);
+  if (rd != sz) { free(buf); return nullptr; }
+  return buf;
+}
+void loadFonts() {
+  g_titleFont = loadVlwFile(g_titleFontPath); g_titleFontReady = (g_titleFont != nullptr);
+  g_bodyFont  = loadVlwFile(g_bodyFontPath);  g_bodyFontReady  = (g_bodyFont  != nullptr);
+}
+
+// Lista los libros (.txt) de /Libros.
+void scanBooks() {
+  g_books.clear();
+  if (!sd_ready) return;
+  File dir = SD.open(g_librosDir.c_str());
+  if (!dir || !dir.isDirectory()) { if (dir) dir.close(); return; }
+  for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+    if (!f.isDirectory()) {
+      String n = f.path(); String low = n; low.toLowerCase();
+      if (low.endsWith(".txt")) g_books.push_back(n);
+    }
+    f.close();
+  }
+  dir.close();
+  Serial.printf("Libros (.txt) en %s: %u\n", g_librosDir.c_str(), (unsigned)g_books.size());
 }
 
 bool connectWiFi() {
@@ -923,6 +958,159 @@ void drawMusic() {
   canvas.pushSprite(0, 0);
 }
 
+// ============================ MODO 4: LIBRO (lector TXT) ============================
+// Pagina el fichero de texto en streaming (sin cargarlo entero). Renderiza con la
+// fuente de lectura (acentos). Guarda libro+pagina en NVS. TXT en UTF-8.
+static constexpr int LIB_MARGIN = 14;   // margen lateral
+static constexpr int LIB_TOP    = 56;   // inicio del texto (bajo cabecera)
+static constexpr int LIB_LINE_H = 28;   // alto de linea
+
+// Clave NVS unica por libro (hash FNV-1a del path) para recordar su pagina.
+String bookKey() {
+  uint32_t h = 2166136261u;
+  const String& p = g_books[g_bookIdx];
+  for (size_t i = 0; i < p.length(); i++) { h ^= (uint8_t)p[i]; h *= 16777619u; }
+  char k[12]; snprintf(k, sizeof(k), "b%08lX", (unsigned long)h);
+  return String(k);
+}
+void bookSavePos() {
+  if (g_books.empty()) return;
+  prefs.putUInt(bookKey().c_str(), g_pageStart);
+  prefs.putInt("lastbook", g_bookIdx);
+}
+
+// Dibuja la pagina que empieza en g_pageStart y calcula g_nextPageStart.
+void drawLibro() {
+  const int W = M5.Display.width(), H = M5.Display.height();
+  canvas.fillSprite(WHITE);
+
+  bool useBody = g_bodyFontReady && canvas.loadFont(g_bodyFont);
+
+  // Cabecera: nombre + bateria
+  canvas.setTextDatum(top_left); canvas.setTextColor(BLACK);
+  if (!useBody) canvas.setFont(&fonts::FreeSansBold12pt7b);
+  if (g_books.empty()) {
+    if (useBody) canvas.unloadFont();
+    drawCenteredMsg("Sin libros (.txt) en", H / 2 - 16, BLACK, &fonts::FreeSansBold18pt7b);
+    drawCenteredMsg(g_librosDir.c_str(), H / 2 + 16, BLACK, &fonts::FreeSansBold18pt7b);
+    canvas.pushSprite(0, 0); return;
+  }
+  String name = trackName(g_books[g_bookIdx]);   // nombre sin ruta/extension
+  canvas.drawString(name, LIB_MARGIN, 10);
+  canvas.setTextDatum(top_right);
+  int bat = M5.Power.getBatteryLevel();
+  char hdr[24]; snprintf(hdr, sizeof(hdr), "Bat %d%%", bat < 0 ? 0 : bat);
+  canvas.drawString(hdr, W - LIB_MARGIN, 10);
+  canvas.drawFastHLine(LIB_MARGIN, 44, W - 2 * LIB_MARGIN, BLACK);
+
+  // Leer un trozo desde la posicion actual y paginar por palabras
+  const int maxW = W - 2 * LIB_MARGIN;
+  const int linesPerPage = (H - LIB_TOP - 34) / LIB_LINE_H;   // deja hueco para la ayuda
+  File f = SD.open(g_books[g_bookIdx].c_str());
+  String chunk;
+  if (f) {
+    f.seek(g_pageStart);
+    const size_t CHUNK = 7000;
+    chunk.reserve(CHUNK);
+    for (size_t i = 0; i < CHUNK && f.available(); i++) chunk += (char)f.read();
+    f.close();
+  }
+
+  int pos = 0, len = chunk.length(), y = LIB_TOP, linesDrawn = 0;
+  canvas.setTextDatum(top_left); canvas.setTextColor(BLACK);
+  while (linesDrawn < linesPerPage && pos < len) {
+    if (chunk[pos] == '\r') { pos++; continue; }
+    if (chunk[pos] == '\n') { pos++; y += LIB_LINE_H; linesDrawn++; continue; }  // parrafo / linea en blanco
+    String line; int linePos = pos;
+    while (linePos < len && chunk[linePos] != '\n') {
+      int ws = linePos; while (ws < len && chunk[ws] != ' ' && chunk[ws] != '\n') ws++;  // palabra
+      String word = chunk.substring(linePos, ws);
+      String cand = line.length() ? line + " " + word : word;
+      if (canvas.textWidth(cand) <= maxW || line.length() == 0) {
+        line = cand; linePos = ws;
+        if (linePos < len && chunk[linePos] == ' ') linePos++;   // consume el espacio
+      } else break;   // no cabe -> fin de linea
+    }
+    canvas.drawString(line, LIB_MARGIN, y);
+    pos = linePos;
+    if (pos < len && chunk[pos] == '\n') pos++;   // consume el salto que cierra la linea
+    y += LIB_LINE_H; linesDrawn++;
+  }
+  g_nextPageStart = g_pageStart + pos;
+
+  if (useBody) canvas.unloadFont();
+  // Ayuda discreta abajo
+  canvas.setFont(&fonts::FreeSansBold12pt7b); canvas.setTextColor(BLACK); canvas.setTextDatum(bottom_center);
+  canvas.drawString("UP/DN pasar pag   -   manten G1: lista   -   G1: salir", W / 2, H - 4);
+  canvas.pushSprite(0, 0);
+}
+
+void pageNext() {
+  if (g_books.empty()) return;
+  File f = SD.open(g_books[g_bookIdx].c_str()); size_t fsz = f ? f.size() : 0; if (f) f.close();
+  if (g_nextPageStart <= g_pageStart || g_nextPageStart >= fsz) return;   // fin del libro
+  g_pageStack.push_back(g_pageStart);
+  g_pageStart = g_nextPageStart;
+  bookSavePos(); g_needRedraw = true;
+}
+void pagePrev() {
+  if (g_books.empty() || g_pageStack.empty()) return;
+  g_pageStart = g_pageStack.back(); g_pageStack.pop_back();
+  bookSavePos(); g_needRedraw = true;
+}
+// Mover la seleccion en el listado.
+void listMove(int d) {
+  if (g_books.empty()) return;
+  int n = g_books.size();
+  g_sel = (g_sel + d % n + n) % n;
+  g_needRedraw = true;
+}
+// Abrir el libro seleccionado en su ultima pagina leida.
+void bookOpenSelected() {
+  if (g_books.empty()) return;
+  g_bookIdx = g_sel;
+  g_pageStart = prefs.getUInt(bookKey().c_str(), 0);   // posicion guardada de ESTE libro
+  g_pageStack.clear();
+  g_libState = LIB_READING;
+  bookSavePos(); g_needRedraw = true;
+}
+
+// Selector de archivos (lista de /Libros).
+void drawLibroList() {
+  const int W = M5.Display.width(), H = M5.Display.height();
+  canvas.fillSprite(WHITE);
+  bool useBody = g_bodyFontReady && canvas.loadFont(g_bodyFont);
+  if (!useBody) canvas.setFont(&fonts::FreeSansBold18pt7b);
+
+  canvas.setTextDatum(top_left); canvas.setTextColor(BLACK);
+  canvas.drawString("LIBROS", LIB_MARGIN, 10);
+  canvas.drawFastHLine(LIB_MARGIN, 44, W - 2 * LIB_MARGIN, BLACK);
+
+  if (g_books.empty()) {
+    if (useBody) canvas.unloadFont();
+    drawCenteredMsg("Sin libros (.txt) en", H / 2 - 16, BLACK, &fonts::FreeSansBold18pt7b);
+    drawCenteredMsg(g_librosDir.c_str(), H / 2 + 16, BLACK, &fonts::FreeSansBold18pt7b);
+    canvas.pushSprite(0, 0); return;
+  }
+
+  const int rowH = 34, top = 56;
+  int visible = (H - top - 30) / rowH;
+  int n = g_books.size();
+  int first = 0;                                   // ventana de scroll alrededor de la seleccion
+  if (n > visible) { first = g_sel - visible / 2; if (first < 0) first = 0; if (first > n - visible) first = n - visible; }
+  for (int i = 0; i < visible && (first + i) < n; i++) {
+    int idx = first + i, y = top + i * rowH;
+    if (idx == g_sel) canvas.fillRect(LIB_MARGIN - 4, y - 2, W - 2 * LIB_MARGIN + 8, rowH - 2, BLUE);
+    canvas.setTextColor(idx == g_sel ? WHITE : BLACK);
+    canvas.setTextDatum(top_left);
+    canvas.drawString(trackName(g_books[idx]), LIB_MARGIN, y);
+  }
+  if (useBody) canvas.unloadFont();
+  canvas.setFont(&fonts::FreeSansBold12pt7b); canvas.setTextColor(BLACK); canvas.setTextDatum(bottom_center);
+  canvas.drawString("UP/DN elegir   -   x2 abrir   -   G1 salir", W / 2, H - 4);
+  canvas.pushSprite(0, 0);
+}
+
 void drawCurrentMode() {
   auto dt = M5.Rtc.getDateTime();
   switch (g_mode) {
@@ -932,7 +1120,7 @@ void drawCurrentMode() {
       break;
     case MODE_CARRUSEL: drawCarrusel(); break;
     case MODE_MUSICA:   drawMusic(); break;
-    case MODE_LIBRO:    drawConstruccion("LIBRO",  "Lector TXT/EPUB (en construccion)"); break;
+    case MODE_LIBRO:    if (g_libState == LIB_LIST) drawLibroList(); else drawLibro(); break;
     default: break;
   }
 }
@@ -984,6 +1172,7 @@ void changeMode() {
   Serial.printf("-> Modo %s\n", MODE_NAMES[g_mode]);
   if (g_mode == MODE_CARRUSEL) last_carousel_ms = millis();
   else setPanelRotation(0);          // el resto de modos en vertical
+  if (g_mode == MODE_LIBRO) { g_libState = LIB_LIST; g_sel = g_bookIdx; }  // al entrar: selector
   applyEpdMode();
   g_needRedraw = true;
 }
@@ -992,6 +1181,8 @@ void modeLongPress() {
     showBusy("Actualizando (WiFi)...");
     fetchAllOnline(true);
     g_busy = false; g_needRedraw = true;
+  } else if (g_mode == MODE_LIBRO) {           // volver al selector de libros
+    g_libState = LIB_LIST; g_sel = g_bookIdx; g_needRedraw = true;
   }
 }
 void modeUp() {
@@ -1047,7 +1238,8 @@ void setup() {
   g_clima.assign(numLocs(), ClimaCache{});
   scanImages();                          // lista fotos de la carpeta configurada (/Fotos)
   scanMusic();                           // lista canciones de /Musica
-  loadTitleFont();                       // fuente VLW con acentos (SD)
+  scanBooks();                           // lista libros .txt de /Libros
+  loadFonts();                           // fuentes VLW con acentos (titulo y cuerpo)
   audioInit();                           // codec ES8311 + I2S
   irsend.begin();                        // emisor IR (modo oculto TV-B-Gone)
 
@@ -1059,6 +1251,13 @@ void setup() {
   g_mode = (Mode)prefs.getUChar("mode", MODE_CLIMA);
   if (g_mode >= MODE_COUNT) g_mode = MODE_CLIMA;
   applyEpdMode();
+  // El selector de libros arranca en el ultimo leido (cada libro carga su pagina al abrirlo)
+  int lastBook = prefs.getInt("lastbook", 0);
+  if (!g_books.empty()) {
+    if (lastBook < 0 || lastBook >= (int)g_books.size()) lastBook = 0;
+    g_bookIdx = lastBook; g_sel = lastBook;
+  }
+  g_libState = LIB_LIST;
   Serial.printf("Modo inicial: %s\n", MODE_NAMES[g_mode]);
 
   last_sht_ms = millis();
@@ -1088,6 +1287,17 @@ void loop() {
     if (btnDown.wasDoubleClicked())    musicPrev();
     else if (btnDown.wasHold())        musicTogglePlay();
     else if (btnDown.wasClicked())     musicVolUp();
+  } else if (g_mode == MODE_LIBRO) {
+    if (g_libState == LIB_LIST) {
+      // selector: UP/DOWN mueve, doble-click abre el libro
+      if (btnUp.wasDoubleClicked() || btnDown.wasDoubleClicked()) bookOpenSelected();
+      else if (btnUp.wasClicked())   listMove(-1);
+      else if (btnDown.wasClicked()) listMove(+1);
+    } else {
+      // lectura: UP/DOWN pasa pagina
+      if (btnUp.wasClicked())   pagePrev();
+      if (btnDown.wasClicked()) pageNext();
+    }
   } else {
     if (btnUp.wasPressed())   modeUp();      // resto de modos: respuesta inmediata
     if (btnDown.wasPressed()) modeDown();

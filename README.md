@@ -25,7 +25,7 @@
   panel** según la orientación de cada foto.
 - 🎵 **Música** — reproductor desde la SD (**MP3 / M4A / FLAC / WAV / AAC**) con el códec ES8311.
   Títulos con acentos correctos (fuente propia).
-- 📖 **Libro** *(en construcción)* — lector de TXT / EPUB desde `/Libros`.
+- 📖 **Libro** — lector de **TXT** desde `/Libros` con selector de archivos y memoria de página por libro (EPUB próximamente).
 - 📺 **TV-B-Gone (modo oculto)** — apaga televisores por IR (108 códigos europeos).
 - 🕒 Hora por **NTP** mantenida en el **RTC**, con horario de verano automático.
 
@@ -49,8 +49,10 @@ Tres botones de usuario (el cuarto es el de encendido):
 | Clima | Vista anterior/siguiente | — | — |
 | Carrusel | Foto anterior/siguiente | — | — |
 | Música | **Volumen** −/+ | **Canción** ant/sig | **Play / Pausa** |
+| Libro *(lista)* | Mover selección | **Abrir** libro | — |
+| Libro *(leyendo)* | Página ant/sig | — | **Volver a la lista** (mantener G1) |
 
-El modo activo se guarda en NVS y se restaura al reiniciar.
+El modo activo se guarda en NVS y se restaura al reiniciar. En **Libro**, cada archivo recuerda su última página.
 
 ---
 
@@ -62,8 +64,9 @@ Formatea en **FAT32** y crea esta estructura en la raíz:
 /config.json        ← configuración
 /Fotos/             ← imágenes del carrusel  (.jpg .jpeg .png .bmp)
 /Musica/            ← canciones  (.mp3 .m4a .flac .wav .aac)
-/Libros/            ← libros (.txt/.epub — futuro)
-/fonts/title.vlw    ← fuente con acentos para los títulos (ver "Fuentes")
+/Libros/            ← libros (.txt en UTF-8; .epub próximamente)
+/fonts/title.vlw    ← fuente con acentos para los títulos
+/fonts/body.vlw     ← fuente con acentos para el lector de libros
 ```
 
 ### `config.json`
@@ -103,6 +106,7 @@ Formatea en **FAT32** y crea esta estructura en la raíz:
 | `photo_auto_rotate` | `true` = gira el panel según la orientación de cada foto. |
 | `fotos_dir`/`musica_dir`/`libros_dir` | Carpetas en la SD. |
 | `font_title` | Fuente VLW (con acentos) para los títulos. |
+| `font_body` | Fuente VLW (con acentos) para el lector de libros. |
 | `locations` | Localidades del clima: `municipio` = código INE (predicción); `estacion` = idema de observación AEMET (opcional, `""` = solo predicción). |
 
 > 🔒 Las credenciales reales viven **solo en la microSD**, nunca en el repositorio.
@@ -232,7 +236,8 @@ Abre `M5PaperColor_Reloj/M5PaperColor_Reloj.ino`, selecciona la placa y sube.
 - [x] Carrusel (auto-rotación)
 - [x] Música (ES8311, MP3/M4A/FLAC, controles iPod Shuffle, acentos VLW)
 - [x] Modo oculto TV-B-Gone (IR + feedback LED)
-- [ ] **Modo libro** (TXT / EPUB)
+- [x] Modo libro **TXT** (selector + paginado + memoria por libro)
+- [ ] Modo libro **EPUB** (descompresión ZIP + extracción de texto)
 - [ ] Modo de bajo consumo (deep sleep)
 
 ---

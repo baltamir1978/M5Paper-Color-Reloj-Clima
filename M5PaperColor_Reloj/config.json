@@ -16,6 +16,7 @@
   "musica_dir": "/Musica",
   "libros_dir": "/Libros",
   "font_title": "/fonts/title.vlw",
+  "font_body": "/fonts/body.vlw",
 
   "photo_auto_rotate": true,
 
