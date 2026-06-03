@@ -1154,9 +1154,16 @@ void drawCurrentMode() {
 }
 
 void applyEpdMode() {
-  // Fotos en calidad; resto en epd_fast (color + razonablemente rapido). El e-paper a color
-  // solo hace refrescos COMPLETOS, asi que minimizamos la FRECUENCIA, no el tamano.
-  M5.Display.setEpdMode(g_mode == MODE_CARRUSEL ? epd_mode_t::epd_quality : epd_mode_t::epd_fast);
+  // En el ED2208 los modos solo cambian el DITHERING (no la velocidad): se elige el logico
+  // por contenido. Fotos -> quality (mejor color); libros -> text (texto nitido);
+  // resto (clima/musica, con color) -> fast.
+  epd_mode_t m;
+  switch (g_mode) {
+    case MODE_CARRUSEL: m = epd_mode_t::epd_quality; break;
+    case MODE_LIBRO:    m = epd_mode_t::epd_text;    break;
+    default:            m = epd_mode_t::epd_fast;    break;
+  }
+  M5.Display.setEpdMode(m);
 }
 
 // ============================ MODO OCULTO: TV-B-Gone (IR) ============================
