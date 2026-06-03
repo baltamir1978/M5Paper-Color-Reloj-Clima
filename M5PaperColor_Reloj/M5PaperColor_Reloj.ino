@@ -39,6 +39,7 @@
 #include <Preferences.h>
 #include <time.h>
 #include <vector>
+#include "Audio.h"        // ESP32-audioI2S (schreibfaul1) v3.4.6
 
 // Declaraciones adelantadas (el IDE de Arduino inserta los prototipos auto-
 // generados tras los #include, antes de los struct; esto evita el error).
@@ -100,6 +101,20 @@ std::vector<String> g_images;
 size_t g_img_idx = 0;
 uint32_t last_carousel_ms = 0;
 int g_rot = -1;   // rotacion actual del panel (1=apaisado, 0=vertical)
+
+// Musica (estilo iPod Shuffle)
+Audio  audio;                // motor de audio (I2S + decodificador)
+std::vector<String> g_music;
+size_t g_track = 0;
+int    g_volume = 12;        // 0..21
+bool   g_playing = false;
+bool   g_loaded = false;     // hay una pista cargada
+bool   g_audioReady = false; // ES8311 + I2S inicializados
+uint32_t g_playStartMs = 0;  // marca de inicio de pista (para detectar fin)
+// Pines de audio (esquematico C151): ES8311 @ I2C interno 0x18, MCLK=BCLK (sin pin MCLK)
+static constexpr int I2S_BCLK_PIN = 40, I2S_LRCK_PIN = 41, I2S_DOUT_PIN = 38;
+static constexpr int PIN_CODEC_EN = 45, PIN_SPK_EN = 46;
+static constexpr uint8_t ES8311_ADDR = 0x18;
 
 // Clima
 int g_view = 0;   // 0=LOCAL, 1..N = ciudad (loc = g_view-1)
@@ -313,7 +328,7 @@ bool aemetFetch(int idx) {
   ClimaCache& cc = g_clima[idx];
   cc.nDays = 0;
   for (JsonObject day : dias) {
-    if (cc.nDays >= 7) break;
+    if (cc.nDays >= 4) break;   // hoy + 3 proximos
     ClimaDay& cd = cc.day[cc.nDays];
     strlcpy(cd.fecha, day["fecha"] | "", sizeof(cd.fecha));
     cd.wday = wdayFromFecha(cd.fecha);
@@ -397,42 +412,127 @@ void fetchAllOnline(bool withNtp) {
 }
 
 // ============================ DIBUJO ============================
-// Prediccion compacta como FILAS de dia (hasta 7): dia + cielo + humedad a la izquierda,
-// max/min y lluvia a la derecha. Aprovecha el alto del modo vertical.
-void drawForecastCards(ClimaCache& cc, int top, int bottom) {
+// --- Iconos del tiempo (aprovechan el color del e-paper) ---
+void fillCloud(int cx, int cy, int s, uint16_t col) {
+  canvas.fillCircle(cx - s, cy, (s * 2) / 3, col);
+  canvas.fillCircle(cx + s, cy, (s * 2) / 3, col);
+  canvas.fillCircle(cx, cy - s / 3, s, col);
+  canvas.fillRect(cx - s, cy - s / 3, 2 * s, (s * 2) / 3 + 2, col);
+}
+void drawWeatherIcon(int cx, int cy, int s, const char* desc) {
+  String d = desc ? desc : ""; d.toLowerCase();
+  bool storm = d.indexOf("torment") >= 0;
+  bool snow  = !storm && d.indexOf("niev") >= 0;
+  bool rain  = !storm && !snow && (d.indexOf("lluvia") >= 0 || d.indexOf("lluv") >= 0 || d.indexOf("chubas") >= 0);
+  bool fog   = d.indexOf("niebl") >= 0 || d.indexOf("brum") >= 0;
+  bool partly= d.indexOf("poco nub") >= 0 || d.indexOf("intervalos") >= 0 || d.indexOf("nubes altas") >= 0;
+  bool cloudy= d.indexOf("cubierto") >= 0 || d.indexOf("muy nub") >= 0 || (d.indexOf("nub") >= 0 && !partly);
+  bool hasCloud = storm || snow || rain || cloudy || partly;
+
+  if (fog) {
+    for (int i = 0; i < 3; i++) canvas.fillRect(cx - s, cy - s / 2 + i * (s / 2), 2 * s, s / 6 + 1, BLUE);
+    return;
+  }
+  if (!hasCloud || partly) {                       // sol (solo, o asomando tras la nube)
+    int sx = hasCloud ? cx - s / 2 : cx;
+    int sy = hasCloud ? cy - s / 2 : cy;
+    int sr = hasCloud ? s / 2 : (s * 2) / 3;
+    if (!hasCloud)
+      for (int a = 0; a < 360; a += 45) {
+        float r = a * 3.14159f / 180.0f;
+        canvas.drawLine(sx + cosf(r) * sr * 1.3f, sy + sinf(r) * sr * 1.3f,
+                        sx + cosf(r) * sr * 1.7f, sy + sinf(r) * sr * 1.7f, YELLOW);
+      }
+    canvas.fillCircle(sx, sy, sr, YELLOW);
+  }
+  if (hasCloud) {                                  // nube con contorno negro
+    int ccy = cy + s / 4;
+    fillCloud(cx, ccy, (s * 2) / 3, BLACK);
+    fillCloud(cx, ccy, (s * 2) / 3 - 3, WHITE);
+  }
+  int py = cy + s + 2;
+  if (rain)  for (int i = -1; i <= 1; i++) canvas.fillCircle(cx + i * (s / 2), py, 2, BLUE);
+  if (storm) canvas.fillTriangle(cx - 3, cy + s / 3, cx + 7, cy + s / 3, cx - 1, py + 5, YELLOW);
+  if (snow)  for (int i = -1; i <= 1; i++) { int x = cx + i * (s / 2); canvas.drawLine(x - 3, py, x + 3, py, BLUE); canvas.drawLine(x, py - 3, x, py + 3, BLUE); }
+}
+
+// Texto con salto de linea por palabras. Devuelve la Y tras la ultima linea.
+int drawWrapped(const char* text, int x, int y, int maxW, int lineH) {
+  canvas.setTextDatum(top_left);
+  String s = text ? text : "", line = "", word = "";
+  int yy = y;
+  for (int i = 0; i <= (int)s.length(); i++) {
+    char c = (i < (int)s.length()) ? s[i] : ' ';
+    if (c == ' ') {
+      String test = line.length() ? line + " " + word : word;
+      if (canvas.textWidth(test) > maxW && line.length()) { canvas.drawString(line, x, yy); yy += lineH; line = word; }
+      else line = test;
+      word = "";
+    } else word += c;
+  }
+  if (line.length()) { canvas.drawString(line, x, yy); yy += lineH; }
+  return yy;
+}
+
+// Bloque destacado de HOY (icono grande + cielo + max/min + lluvia + humedad).
+void drawToday(ClimaCache& cc, int top, int bottom) {
   const int W = M5.Display.width();
-  int n = cc.nDays; if (n <= 0) return;
-  int rowH = (bottom - top) / n;
-  for (int i = 0; i < n; i++) {
-    int y0 = top + i * rowH;
-    if (i > 0) canvas.drawFastHLine(10, y0, W - 20, BLACK);
-    ClimaDay& d = cc.day[i];
+  ClimaDay& d = cc.day[0];
+  canvas.setFont(&fonts::FreeSansBold18pt7b); canvas.setTextDatum(top_left); canvas.setTextColor(BLACK);
+  canvas.drawString("HOY", 12, top);
 
-    // Izquierda: dia (grande) + cielo + humedad
-    canvas.setTextDatum(top_left);
-    canvas.setFont(&fonts::FreeSansBold18pt7b); canvas.setTextColor(BLACK);
-    canvas.drawString(DIAS_C[d.wday], 12, y0 + 4);
-    canvas.setFont(&fonts::FreeSansBold12pt7b); canvas.setTextColor(BLACK);
-    char cielo[26]; strlcpy(cielo, d.cielo, sizeof(cielo));
-    canvas.drawString(cielo, 12, y0 + 34);
-    if (d.humMax >= 0) {
-      char hr[20]; snprintf(hr, sizeof(hr), "HR %d-%d%%", d.humMin, d.humMax);
-      canvas.setTextColor(BLUE); canvas.drawString(hr, 12, y0 + 54);
-    }
+  drawWeatherIcon(66, (top + bottom) / 2 + 6, 42, d.cielo);
 
-    // Derecha: max/min (rojo/azul) y lluvia
-    canvas.setFont(&fonts::FreeSansBold18pt7b);
-    canvas.setTextDatum(top_right);
+  int rx = 132;
+  // Temperaturas grandes max/min
+  canvas.setFont(&fonts::FreeSansBold24pt7b); canvas.setTextDatum(top_left);
+  char s[8];
+  snprintf(s, sizeof(s), "%d", d.tMax);
+  canvas.setTextColor(RED);   canvas.drawString(s, rx, top + 22); int wmax = canvas.textWidth(s);
+  canvas.setTextColor(BLACK); canvas.drawString(" / ", rx + wmax, top + 22); int wsl = canvas.textWidth(" / ");
+  snprintf(s, sizeof(s), "%d", d.tMin);
+  canvas.setTextColor(BLUE);  canvas.drawString(s, rx + wmax + wsl, top + 22);
+  canvas.setFont(&fonts::FreeSansBold12pt7b); canvas.setTextColor(BLACK);
+  canvas.drawString("max / min  C", rx, top + 60);
+  // Cielo (con salto)
+  drawWrapped(d.cielo, rx, top + 86, W - rx - 10, 22);
+  // Lluvia + humedad anclados abajo
+  canvas.setTextColor(BLUE);
+  char lab[28]; snprintf(lab, sizeof(lab), "Lluvia %d%%", d.probLluvia);
+  canvas.drawString(lab, rx, bottom - 44);
+  if (d.humMax >= 0) { char hr[28]; snprintf(hr, sizeof(hr), "Humedad %d-%d%%", d.humMin, d.humMax); canvas.drawString(hr, rx, bottom - 22); }
+}
+
+// Filas compactas de los proximos dias (icono + dia + cielo + max/min + lluvia).
+void drawUpcomingRows(ClimaCache& cc, int startIdx, int count, int top, int bottom) {
+  const int W = M5.Display.width();
+  int rows = 0;
+  for (int k = 0; k < count && (startIdx + k) < cc.nDays; k++) rows++;
+  if (rows == 0) return;
+  int rowH = (bottom - top) / rows;
+  for (int k = 0; k < rows; k++) {
+    ClimaDay& d = cc.day[startIdx + k];
+    int y0 = top + k * rowH, cy = y0 + rowH / 2;
+    if (k > 0) canvas.drawFastHLine(10, y0, W - 20, BLACK);
+
+    drawWeatherIcon(32, cy, (int)(rowH * 0.26f), d.cielo);
+
+    canvas.setFont(&fonts::FreeSansBold18pt7b); canvas.setTextColor(BLACK); canvas.setTextDatum(middle_left);
+    canvas.drawString(DIAS_C[d.wday], 62, cy - 11);
+    canvas.setFont(&fonts::FreeSansBold12pt7b);
+    char cielo[20]; strlcpy(cielo, d.cielo, sizeof(cielo));
+    canvas.drawString(cielo, 62, cy + 13);
+
+    canvas.setFont(&fonts::FreeSansBold18pt7b); canvas.setTextDatum(middle_right);
     char s[8];
     snprintf(s, sizeof(s), "%d", d.tMin);
-    canvas.setTextColor(BLUE);  canvas.drawString(s, W - 12, y0 + 4); int wmin = canvas.textWidth(s);
-    canvas.setTextColor(BLACK); canvas.drawString("/", W - 12 - wmin, y0 + 4); int wsl = canvas.textWidth("/");
+    canvas.setTextColor(BLUE);  canvas.drawString(s, W - 12, cy - 11); int wmin = canvas.textWidth(s);
+    canvas.setTextColor(BLACK); canvas.drawString("/", W - 12 - wmin, cy - 11); int wsl = canvas.textWidth("/");
     snprintf(s, sizeof(s), "%d", d.tMax);
-    canvas.setTextColor(RED);   canvas.drawString(s, W - 12 - wmin - wsl, y0 + 4);
-
-    canvas.setFont(&fonts::FreeSansBold12pt7b); canvas.setTextColor(BLUE);
+    canvas.setTextColor(RED);   canvas.drawString(s, W - 12 - wmin - wsl, cy - 11);
+    canvas.setFont(&fonts::FreeSansBold12pt7b); canvas.setTextColor(BLUE); canvas.setTextDatum(middle_right);
     char lab[16]; snprintf(lab, sizeof(lab), "lluvia %d%%", d.probLluvia);
-    canvas.drawString(lab, W - 12, y0 + 36);
+    canvas.drawString(lab, W - 12, cy + 13);
   }
 }
 
@@ -446,13 +546,14 @@ void drawWeatherLocal(const m5::rtc_datetime_t& dt) {
   char hdr[16]; snprintf(hdr, sizeof(hdr), "LOCAL  1/%d", numViews());
   canvas.drawString(hdr, 12, 8);
   int bat = M5.Power.getBatteryLevel();
-  char bs[12]; snprintf(bs, sizeof(bs), (bat < 0) ? "bat --%%" : "bat %d%%", bat);
+  char bs[12]; snprintf(bs, sizeof(bs), (bat < 0) ? "Bat --%%" : "Bat %d%%", bat);
   canvas.setTextDatum(top_right); canvas.drawString(bs, W - 12, 8);
 
   // Hora grande
   char hm[8]; snprintf(hm, sizeof(hm), "%02d:%02d", dt.time.hours, dt.time.minutes);
-  canvas.setFont(&fonts::Font7); canvas.setTextDatum(middle_center); canvas.setTextColor(BLACK);
-  canvas.drawString(hm, W / 2, 150);
+  canvas.setFont(&fonts::Font7); canvas.setTextSize(2); canvas.setTextDatum(middle_center); canvas.setTextColor(BLACK);
+  canvas.drawString(hm, W / 2, 160);
+  canvas.setTextSize(1);
 
   // Fecha en 2 lineas
   int wday = (dt.date.weekDay >= 0 && dt.date.weekDay <= 6) ? dt.date.weekDay : 0;
@@ -495,7 +596,8 @@ void drawWeatherCity(const m5::rtc_datetime_t& dt, int loc) {
   }
 
   ClimaCache& cc = g_clima[loc];
-  int cardsTop = 48;
+  int top = 48;
+  // Observacion actual de estacion (p.ej. El Goloso en Madrid)
   if (cc.obsValid) {
     canvas.setTextDatum(top_left); canvas.setFont(&fonts::FreeSansBold12pt7b); canvas.setTextColor(BLACK);
     char lbl[24]; snprintf(lbl, sizeof(lbl), "Ahora %s", cc.obsTime);
@@ -504,19 +606,29 @@ void drawWeatherCity(const m5::rtc_datetime_t& dt, int loc) {
     snprintf(v, sizeof(v), "%.1fC  %.0f%%", cc.obsTemp, cc.obsHum);
     canvas.setTextColor(RED); canvas.drawString(v, W - 12, 46);
     canvas.drawFastHLine(12, 74, W - 24, BLACK);
-    cardsTop = 82;
+    top = 82;
   }
+
   if (!cc.valid) {
-    drawCenteredMsg("Manten G1 para actualizar", H / 2, BLACK, &fonts::FreeSansBold18pt7b);
+    // Mensaje en 2 lineas y fuente pequena (antes se salia de pantalla)
+    drawCenteredMsg("Manten pulsado G1", H / 2 - 16, BLACK, &fonts::FreeSansBold12pt7b);
+    drawCenteredMsg("para descargar la prediccion", H / 2 + 12, BLACK, &fonts::FreeSansBold12pt7b);
     canvas.pushSprite(0, 0); return;
   }
-  drawForecastCards(cc, cardsTop, H - 22);
+
+  // HOY destacado + 3 proximos dias
+  int todayBottom = top + 178;
+  drawToday(cc, top, todayBottom);
+  canvas.drawFastHLine(10, todayBottom, W - 20, BLACK);
+  drawUpcomingRows(cc, 1, 3, todayBottom + 2, H - 22);
+
+  // Pie: hora de actualizacion + bateria
   canvas.setFont(&fonts::FreeSansBold12pt7b); canvas.setTextColor(BLACK);
   canvas.setTextDatum(bottom_right);
   char upd[24]; snprintf(upd, sizeof(upd), "AEMET %02d:%02d", cc.updH, cc.updM);
   canvas.drawString(upd, W - 8, H - 4);
   int bat = M5.Power.getBatteryLevel();
-  char bs[12]; snprintf(bs, sizeof(bs), (bat < 0) ? "bat --%%" : "bat %d%%", bat);
+  char bs[12]; snprintf(bs, sizeof(bs), (bat < 0) ? "Bat --%%" : "Bat %d%%", bat);
   canvas.setTextDatum(bottom_left); canvas.drawString(bs, 8, H - 4);
   canvas.pushSprite(0, 0);
 }
@@ -628,6 +740,130 @@ void drawConstruccion(const char* titulo, const char* sub) {
   canvas.pushSprite(0, 0);
 }
 
+// ============================ MODO 3: MUSICA (estilo iPod Shuffle) ============================
+// Controles: UP/DOWN click = cancion sig/ant · doble-click = volumen +/- · mantener = play/pausa.
+// NOTA: la salida de audio (decodificacion + codec ES8311) se integra como siguiente paso con
+//       la libreria ESP32-audioI2S. De momento esta funciona la navegacion, volumen y UI.
+
+bool isAudioFile(const String& n0) {
+  String n = n0; n.toLowerCase();
+  return n.endsWith(".mp3") || n.endsWith(".m4a") || n.endsWith(".flac") ||
+         n.endsWith(".wav") || n.endsWith(".aac");
+}
+void scanMusic() {
+  g_music.clear();
+  if (!sd_ready) return;
+  File dir = SD.open(g_musicaDir.c_str());
+  if (!dir || !dir.isDirectory()) { if (dir) dir.close(); return; }
+  for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+    if (!f.isDirectory() && isAudioFile(f.path())) g_music.push_back(f.path());
+    f.close();
+  }
+  dir.close();
+  Serial.printf("Musica en %s: %u\n", g_musicaDir.c_str(), (unsigned)g_music.size());
+}
+// Nombre legible de la pista (sin ruta ni extension).
+String trackName(const String& path) {
+  int slash = path.lastIndexOf('/');
+  String n = (slash >= 0) ? path.substring(slash + 1) : path;
+  int dot = n.lastIndexOf('.');
+  if (dot > 0) n = n.substring(0, dot);
+  return n;
+}
+
+// Inicializa el codec ES8311 (secuencia M5Unified PaperColor, MCLK=BCLK) y el I2S.
+void audioInit() {
+  pinMode(PIN_CODEC_EN, OUTPUT); digitalWrite(PIN_CODEC_EN, HIGH);   // habilita codec
+  pinMode(PIN_SPK_EN, OUTPUT);   digitalWrite(PIN_SPK_EN, HIGH);     // habilita amplificador
+  delay(10);
+  static const uint8_t seq[][2] = {
+    {0x00, 0x80}, {0x01, 0xB5}, {0x02, 0x18}, {0x0D, 0x01},
+    {0x12, 0x00}, {0x13, 0x10}, {0x32, 0xCF}, {0x37, 0x08}
+  };
+  for (auto& r : seq) M5.In_I2C.writeRegister8(ES8311_ADDR, r[0], r[1], 100000);
+
+  audio.setPinout(I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN);   // MCLK no necesario (=BCLK)
+  audio.setAudioTaskCore(0);     // tarea de audio en el core 0 (Arduino corre en el 1)
+  audio.setVolume(g_volume);
+  g_audioReady = true;
+  Serial.println("Audio ES8311 inicializado.");
+}
+
+// --- Acciones de audio (estilo iPod Shuffle) ---
+void musicPlayCurrent() {
+  if (g_music.empty() || !g_audioReady) return;
+  Serial.printf("[MUSICA] play %s (vol %d)\n", trackName(g_music[g_track]).c_str(), g_volume);
+  audio.connecttoFS(SD, g_music[g_track].c_str());
+  audio.setVolume(g_volume);
+  g_loaded = true; g_playing = true; g_playStartMs = millis();
+}
+void musicNext() {
+  if (g_music.empty()) return;
+  g_track = (g_track + 1) % g_music.size();
+  musicPlayCurrent(); g_needRedraw = true;
+}
+void musicPrev() {
+  if (g_music.empty()) return;
+  g_track = (g_track + g_music.size() - 1) % g_music.size();
+  musicPlayCurrent(); g_needRedraw = true;
+}
+// Volumen y play/pausa NO refrescan la pantalla (evita cortes de audio por el e-paper).
+void musicVolUp()   { if (g_volume < 21) g_volume++; if (g_audioReady) audio.setVolume(g_volume); Serial.printf("[MUSICA] vol %d\n", g_volume); }
+void musicVolDown() { if (g_volume > 0)  g_volume--; if (g_audioReady) audio.setVolume(g_volume); Serial.printf("[MUSICA] vol %d\n", g_volume); }
+void musicTogglePlay() {
+  if (g_music.empty()) return;
+  if (!g_loaded) { musicPlayCurrent(); g_needRedraw = true; }   // primer play: carga + muestra pista
+  else { audio.pauseResume(); g_playing = !g_playing; }
+  Serial.printf("[MUSICA] %s\n", g_playing ? "play" : "pausa");
+}
+
+
+void drawMusic() {
+  const int W = M5.Display.width(), H = M5.Display.height();
+  canvas.fillSprite(WHITE);
+
+  // Cabecera
+  canvas.setFont(&fonts::FreeSansBold18pt7b); canvas.setTextDatum(top_left); canvas.setTextColor(BLACK);
+  canvas.drawString("MUSICA", 12, 8);
+  int bat = M5.Power.getBatteryLevel();
+  char bs[12]; snprintf(bs, sizeof(bs), (bat < 0) ? "Bat --%%" : "Bat %d%%", bat);
+  canvas.setTextDatum(top_right); canvas.drawString(bs, W - 12, 8);
+  canvas.drawFastHLine(12, 42, W - 24, BLACK);
+
+  if (g_music.empty()) {
+    drawCenteredMsg("Sin musica en", H / 2 - 16, BLACK, &fonts::FreeSansBold18pt7b);
+    drawCenteredMsg(g_musicaDir.c_str(), H / 2 + 16, BLACK, &fonts::FreeSansBold18pt7b);
+    canvas.pushSprite(0, 0); return;
+  }
+
+  // Pista actual (n / total)
+  canvas.setFont(&fonts::FreeSansBold12pt7b); canvas.setTextDatum(top_right); canvas.setTextColor(BLACK);
+  char idx[16]; snprintf(idx, sizeof(idx), "%u / %u", (unsigned)(g_track + 1), (unsigned)g_music.size());
+  canvas.drawString(idx, W - 12, 50);
+
+  // Nombre de la pista (grande, centrado, hasta 2 lineas). Sin icono ni barra:
+  // asi solo refrescamos la pantalla al cambiar de cancion (no al tocar volumen).
+  canvas.setFont(&fonts::FreeSansBold24pt7b); canvas.setTextColor(BLACK); canvas.setTextDatum(middle_center);
+  {
+    String name = trackName(g_music[g_track]);
+    if (canvas.textWidth(name) <= W - 24) {
+      canvas.drawString(name, W / 2, H / 2);
+    } else {
+      int half = name.length() / 2;
+      int sp = name.indexOf(' ', half); if (sp < 0) sp = half;
+      canvas.drawString(name.substring(0, sp), W / 2, H / 2 - 26);
+      canvas.drawString(name.substring(sp + 1), W / 2, H / 2 + 26);
+    }
+  }
+
+  // Ayuda de controles (2 lineas para que no se corte)
+  canvas.setFont(&fonts::FreeSansBold12pt7b); canvas.setTextColor(BLACK); canvas.setTextDatum(bottom_center);
+  canvas.drawString("Click: volumen    x2: cancion", W / 2, H - 34);
+  canvas.drawString("Manten: play / pausa", W / 2, H - 10);
+
+  canvas.pushSprite(0, 0);
+}
+
 void drawCurrentMode() {
   auto dt = M5.Rtc.getDateTime();
   switch (g_mode) {
@@ -636,7 +872,7 @@ void drawCurrentMode() {
       else                               drawWeatherCity(dt, g_view - 1);
       break;
     case MODE_CARRUSEL: drawCarrusel(); break;
-    case MODE_MUSICA:   drawConstruccion("MUSICA", "Reproductor MP3 (en construccion)"); break;
+    case MODE_MUSICA:   drawMusic(); break;
     case MODE_LIBRO:    drawConstruccion("LIBRO",  "Lector TXT/EPUB (en construccion)"); break;
     default: break;
   }
@@ -680,6 +916,7 @@ void modeDown() {
 void setup() {
   auto cfg = M5.config();
   cfg.clear_display = false;
+  cfg.internal_spk  = false;   // el codec ES8311 lo gestiona la libreria de audio, no M5.Speaker
   M5.begin(cfg);
   Serial.begin(115200);
   delay(200);
@@ -692,6 +929,8 @@ void setup() {
   pinMode(PIN_BTN_UP,   INPUT_PULLUP);
   pinMode(PIN_BTN_DOWN, INPUT_PULLUP);
   btnMode.setHoldThresh(800);
+  btnUp.setHoldThresh(700);                  // mantener UP/DOWN = play/pausa en musica
+  btnDown.setHoldThresh(700);
 
   showBusy("Iniciando..."); g_busy = false;
 
@@ -712,6 +951,8 @@ void setup() {
   loadConfig();                          // sobreescribe defaults si hay /config.json
   g_clima.assign(numLocs(), ClimaCache{});
   scanImages();                          // lista fotos de la carpeta configurada (/Fotos)
+  scanMusic();                           // lista canciones de /Musica
+  audioInit();                           // codec ES8311 + I2S
 
   // Arranque online: NTP + prediccion + observacion (se ve "Iniciando..." mientras tanto)
   fetchAllOnline(true);
@@ -730,6 +971,7 @@ void setup() {
 
 // ============================ LOOP ============================
 void loop() {
+  if (g_audioReady) audio.loop();      // alimenta el decodificador (lo mas a menudo posible)
   M5.update();
 
   uint32_t ms = millis();
@@ -739,8 +981,19 @@ void loop() {
 
   if (btnMode.wasDoubleClicked()) changeMode();
   else if (btnMode.wasHold())     modeLongPress();
-  if (btnUp.wasPressed())   modeUp();      // responde al pulsar (mas agil)
-  if (btnDown.wasPressed()) modeDown();
+
+  if (g_mode == MODE_MUSICA) {
+    // click=volumen +/-, doble-click=cancion sig/ant, mantener=play/pausa
+    if (btnUp.wasDoubleClicked())      musicNext();
+    else if (btnUp.wasHold())          musicTogglePlay();
+    else if (btnUp.wasClicked())       musicVolDown();   // (volumen corregido: estaba al reves)
+    if (btnDown.wasDoubleClicked())    musicPrev();
+    else if (btnDown.wasHold())        musicTogglePlay();
+    else if (btnDown.wasClicked())     musicVolUp();
+  } else {
+    if (btnUp.wasPressed())   modeUp();      // resto de modos: respuesta inmediata
+    if (btnDown.wasPressed()) modeDown();
+  }
 
   // Sensor + refresco de la vista LOCAL: cada 2 min (la pantalla queda fija entre medias)
   if (ms - last_sht_ms >= SHT_UPDATE_MS) {
@@ -756,7 +1009,12 @@ void loop() {
     g_needRedraw = true;
   }
 
+  // Fin de pista -> siguiente (con margen para evitar falso disparo al arrancar)
+  if (g_playing && g_loaded && g_audioReady && (ms - g_playStartMs > 1500) && !audio.isRunning()) {
+    musicNext();
+  }
+
   if (g_needRedraw && !g_busy) { g_needRedraw = false; drawCurrentMode(); }
 
-  delay(10);
+  if (!g_playing) delay(10);   // mientras suena la musica no metemos delay (audio fluido)
 }
