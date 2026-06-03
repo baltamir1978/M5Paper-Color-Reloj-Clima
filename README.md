@@ -209,14 +209,42 @@ Los códigos están en `M5PaperColor_Reloj/tvbgone_codes.h` (portados de
 
 **Placa:** `ESP32S3 Dev Module` · Flash **16 MB** · PSRAM **OPI PSRAM** · USB CDC On Boot **Enabled**
 
-**Librerías:**
-- [M5Unified](https://github.com/m5stack/M5Unified) · [M5GFX](https://github.com/m5stack/M5GFX)
-- [M5UnitENV](https://github.com/m5stack/M5Unit-ENV) (SHT40) · [M5PM1](https://github.com/m5stack/M5PM1)
-- [ArduinoJson](https://arduinojson.org/) (v7)
-- [ESP32-audioI2S](https://github.com/schreibfaul1/ESP32-audioI2S) (música)
-- [IRremoteESP8266](https://github.com/crankyoldgit/IRremoteESP8266) (TV-B-Gone)
-
 Abre `M5PaperColor_Reloj/M5PaperColor_Reloj.ino`, selecciona la placa y sube.
+
+### Versiones probadas (junio 2026)
+
+> ⚠️ La placa es **muy nueva** y las librerías se actualizan a menudo estos primeros meses.
+> Estas son las versiones con las que **compila y funciona**. Si una actualización rompe algo,
+> vuelve a estas (o usa PlatformIO, que las fija automáticamente — ver abajo).
+
+| Componente | Versión |
+|------------|---------|
+| Core **M5Stack/ESP32** (Arduino) | **3.3.7** |
+| M5Unified | 0.2.17 |
+| M5GFX | 0.2.22 |
+| M5Unit-ENV | 1.4.0 |
+| M5PM1 | 1.0.7 |
+| ArduinoJson | 7.4.3 |
+| ESP32-audioI2S (schreibfaul1) | 3.4.6 |
+| IRremoteESP8266 | 2.9.0 |
+
+Enlaces: [M5Unified](https://github.com/m5stack/M5Unified) · [M5GFX](https://github.com/m5stack/M5GFX) ·
+[M5Unit-ENV](https://github.com/m5stack/M5Unit-ENV) · [M5PM1](https://github.com/m5stack/M5PM1) ·
+[ArduinoJson](https://arduinojson.org/) · [ESP32-audioI2S](https://github.com/schreibfaul1/ESP32-audioI2S) ·
+[IRremoteESP8266](https://github.com/crankyoldgit/IRremoteESP8266)
+
+### Compilar con PlatformIO (versiones fijadas)
+
+Para una compilación **reproducible** (sin pelear con el gestor de librerías) hay un
+[`platformio.ini`](platformio.ini) con la plataforma y todas las librerías **fijadas a las versiones
+de arriba**. Usa el fork **pioarduino** (la plataforma oficial de PlatformIO aún no soporta
+arduino-esp32 3.x):
+
+```bash
+pio run             # compilar
+pio run -t upload   # subir
+pio device monitor  # monitor serie
+```
 
 ---
 
@@ -238,6 +266,7 @@ Abre `M5PaperColor_Reloj/M5PaperColor_Reloj.ino`, selecciona la placa y sube.
 - [x] Modo oculto TV-B-Gone (IR + feedback LED)
 - [x] Modo libro **TXT** (selector + paginado + memoria por libro)
 - [ ] Modo libro **EPUB** (descompresión ZIP + extracción de texto)
+- [ ] **Refrescos parciales** del e-paper (actualizar solo la zona que cambia: reloj, pasar página)
 - [ ] Modo de bajo consumo (deep sleep)
 
 ---

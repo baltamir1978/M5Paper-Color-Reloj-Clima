@@ -100,6 +100,11 @@ bool  g_needRedraw = true, g_busy = false;
 float g_temp = NAN, g_hum = NAN;
 bool  sht_ready = false, sd_ready = false;
 uint32_t last_sht_ms = 0;
+// Refresco inteligente de la vista LOCAL (parcial)
+uint32_t g_lastInput = 0;          // ultimo toque de boton (para el ahorro a los 5 min)
+uint32_t g_lastLocalUpdate = 0;
+int      g_lastMin = -1, g_lastDay = -1;
+int      g_localPartials = 0;      // nº de refrescos parciales desde el ultimo completo
 
 // Carrusel
 std::vector<String> g_images;
@@ -602,57 +607,100 @@ void drawUpcomingRows(ClimaCache& cc, int startIdx, int count, int top, int bott
   }
 }
 
-void drawWeatherLocal(const m5::rtc_datetime_t& dt) {
-  const int W = M5.Display.width(), H = M5.Display.height();
-  canvas.fillSprite(WHITE);
+// --- Icono de bateria (verde/amarillo/rojo segun carga). Sirve para canvas y M5.Display. ---
+template<typename G> void drawBatteryIcon(G& g, int x, int y) {
+  int bat = M5.Power.getBatteryLevel(); if (bat < 0) bat = 0;
+  uint16_t col = (bat >= 60) ? GREEN : (bat >= 25) ? YELLOW : RED;
+  const int w = 42, h = 20;
+  g.fillRect(x - 2, y - 2, w + 9, h + 4, WHITE);      // limpia la zona
+  g.drawRect(x, y, w, h, BLACK);
+  g.fillRect(x + w, y + 6, 3, h - 12, BLACK);          // borne
+  g.fillRect(x + 2, y + 2, (w - 4) * bat / 100, h - 4, col);
+}
 
-  // Cabecera: titulo + bateria
-  canvas.setFont(&fonts::FreeSansBold18pt7b);
-  canvas.setTextDatum(top_left); canvas.setTextColor(BLACK);
-  char hdr[16]; snprintf(hdr, sizeof(hdr), "LOCAL  1/%d", numViews());
-  canvas.drawString(hdr, 12, 8);
-  int bat = M5.Power.getBatteryLevel();
-  char bs[12]; snprintf(bs, sizeof(bs), (bat < 0) ? "Bat --%%" : "Bat %d%%", bat);
-  canvas.setTextDatum(top_right); canvas.drawString(bs, W - 12, 8);
-
-  // Hora grande
+// --- Campos de la vista LOCAL (mismas coords para dibujo completo y parcial) ---
+static const int LOC_CLK_Y = 150, LOC_WD_Y = 250, LOC_DT_Y = 300, LOC_TP_Y = 415, LOC_HM_Y = 520;
+template<typename G> void locClock(G& g, const m5::rtc_datetime_t& dt) {
   char hm[8]; snprintf(hm, sizeof(hm), "%02d:%02d", dt.time.hours, dt.time.minutes);
-  canvas.setFont(&fonts::Font7); canvas.setTextSize(2); canvas.setTextDatum(middle_center); canvas.setTextColor(BLACK);
-  canvas.drawString(hm, W / 2, 160);
-  canvas.setTextSize(1);
+  g.setFont(&fonts::Font7); g.setTextSize(2); g.setTextColor(BLACK); g.setTextDatum(middle_center);
+  g.drawString(hm, M5.Display.width() / 2, LOC_CLK_Y); g.setTextSize(1);
+}
+template<typename G> void locDate(G& g, const m5::rtc_datetime_t& dt) {
+  const int W = M5.Display.width();
+  int wd = (dt.date.weekDay >= 0 && dt.date.weekDay <= 6) ? dt.date.weekDay : 0;
+  int mo = (dt.date.month >= 1 && dt.date.month <= 12) ? dt.date.month - 1 : 0;
+  g.setTextColor(BLACK); g.setTextDatum(middle_center);
+  g.setFont(&fonts::FreeSansBold24pt7b); g.drawString(DIAS[wd], W / 2, LOC_WD_Y);
+  char d2[40]; snprintf(d2, sizeof(d2), "%d de %s %d", dt.date.date, MESES[mo], dt.date.year);
+  g.setFont(&fonts::FreeSansBold18pt7b); g.drawString(d2, W / 2, LOC_DT_Y);
+}
+template<typename G> void locTemp(G& g) {
+  char b[16]; snprintf(b, sizeof(b), isnan(g_temp) ? "--.- C" : "%.1f C", g_temp);
+  g.setFont(&fonts::FreeSansBold24pt7b); g.setTextColor(RED); g.setTextDatum(middle_center);
+  g.drawString(b, M5.Display.width() / 2, LOC_TP_Y);
+}
+template<typename G> void locHum(G& g) {
+  char b[16]; snprintf(b, sizeof(b), isnan(g_hum) ? "--.- %%" : "%.0f %%", g_hum);
+  g.setFont(&fonts::FreeSansBold24pt7b); g.setTextColor(BLUE); g.setTextDatum(middle_center);
+  g.drawString(b, M5.Display.width() / 2, LOC_HM_Y);
+}
 
-  // Fecha en 2 lineas
-  int wday = (dt.date.weekDay >= 0 && dt.date.weekDay <= 6) ? dt.date.weekDay : 0;
-  int mes  = (dt.date.month >= 1 && dt.date.month <= 12) ? dt.date.month - 1 : 0;
-  canvas.setFont(&fonts::FreeSansBold24pt7b); canvas.setTextColor(BLACK);
-  canvas.drawString(DIAS[wday], W / 2, 250);
-  char d2[40]; snprintf(d2, sizeof(d2), "%d de %s %d", dt.date.date, MESES[mes], dt.date.year);
-  canvas.setFont(&fonts::FreeSansBold18pt7b);
-  canvas.drawString(d2, W / 2, 300);
-
-  canvas.drawFastHLine(40, 345, W - 80, BLACK);
-
-  // Sensor interior (apilado)
-  char b[16];
-  snprintf(b, sizeof(b), isnan(g_temp) ? "--.- C" : "%.1f C", g_temp);
-  canvas.setFont(&fonts::FreeSansBold24pt7b); canvas.setTextColor(RED);  canvas.drawString(b, W / 2, 410);
-  canvas.setFont(&fonts::FreeSansBold18pt7b); canvas.setTextColor(BLACK); canvas.drawString("Temperatura interior", W / 2, 455);
-  snprintf(b, sizeof(b), isnan(g_hum) ? "--.- %%" : "%.0f %%", g_hum);
-  canvas.setFont(&fonts::FreeSansBold24pt7b); canvas.setTextColor(BLUE); canvas.drawString(b, W / 2, 515);
-  canvas.setFont(&fonts::FreeSansBold18pt7b); canvas.setTextColor(BLACK); canvas.drawString("Humedad", W / 2, 560);
+// Dibujo COMPLETO de la vista LOCAL (al entrar / limpieza periodica).
+void drawWeatherLocal(const m5::rtc_datetime_t& dt) {
+  const int W = M5.Display.width();
+  canvas.fillSprite(WHITE);
+  canvas.setFont(&fonts::FreeSansBold12pt7b); canvas.setTextDatum(top_left); canvas.setTextColor(BLACK);
+  char hdr[16]; snprintf(hdr, sizeof(hdr), "LOCAL  1/%d", numViews());
+  canvas.drawString(hdr, 12, 10);
+  drawBatteryIcon(canvas, W - 53, 8);
+  locClock(canvas, dt);
+  locDate(canvas, dt);
+  canvas.drawFastHLine(40, 355, W - 80, BLACK);
+  locTemp(canvas);
+  canvas.setFont(&fonts::FreeSansBold18pt7b); canvas.setTextColor(BLACK); canvas.setTextDatum(middle_center);
+  canvas.drawString("Temperatura", W / 2, 460);
+  locHum(canvas);
+  canvas.drawString("Humedad", W / 2, 565);
   canvas.pushSprite(0, 0);
+  g_lastMin = dt.time.minutes; g_lastDay = dt.date.date;
+  g_localPartials = 0; g_lastLocalUpdate = millis();
+}
+
+// Refresco PARCIAL: actualiza solo los campos que cambian (reloj/fecha/temp/hum/bateria).
+void updateLocalPartial(const m5::rtc_datetime_t& dt) {
+  const int W = M5.Display.width();
+  M5.Display.setAutoDisplay(false);
+  if (dt.time.minutes != g_lastMin) {
+    M5.Display.fillRect(20, LOC_CLK_Y - 52, W - 40, 104, WHITE);
+    locClock(M5.Display, dt);
+    M5.Display.display(20, LOC_CLK_Y - 52, W - 40, 104);
+    g_lastMin = dt.time.minutes;
+  }
+  if (dt.date.date != g_lastDay) {
+    M5.Display.fillRect(8, LOC_WD_Y - 26, W - 16, 100, WHITE);
+    locDate(M5.Display, dt);
+    M5.Display.display(8, LOC_WD_Y - 26, W - 16, 100);
+    g_lastDay = dt.date.date;
+  }
+  M5.Display.fillRect(8, LOC_TP_Y - 24, W - 16, 48, WHITE); locTemp(M5.Display);
+  M5.Display.display(8, LOC_TP_Y - 24, W - 16, 48);
+  M5.Display.fillRect(8, LOC_HM_Y - 24, W - 16, 48, WHITE); locHum(M5.Display);
+  M5.Display.display(8, LOC_HM_Y - 24, W - 16, 48);
+  drawBatteryIcon(M5.Display, W - 53, 8); M5.Display.display(W - 56, 4, 56, 28);
+  M5.Display.setAutoDisplay(true);
+  if (++g_localPartials >= 20) g_needRedraw = true;   // limpieza periodica (refresco completo)
 }
 
 void drawWeatherCity(const m5::rtc_datetime_t& dt, int loc) {
   const int W = M5.Display.width(), H = M5.Display.height();
   canvas.fillSprite(WHITE);
-  // Cabecera (compacta para 400 px)
-  canvas.setFont(&fonts::FreeSansBold18pt7b);
+  // Cabecera compacta (texto pequeno para que no choque): nombre | hora v/N
+  canvas.setFont(&fonts::FreeSansBold12pt7b);
   canvas.setTextDatum(top_left); canvas.setTextColor(BLACK);
-  canvas.drawString(g_locs[loc].name.c_str(), 12, 6);
-  canvas.setFont(&fonts::FreeSansBold12pt7b); canvas.setTextDatum(top_right);
+  canvas.drawString(g_locs[loc].name.c_str(), 12, 12);
+  canvas.setTextDatum(top_right);
   char hv[16]; snprintf(hv, sizeof(hv), "%02d:%02d  %d/%d", dt.time.hours, dt.time.minutes, loc + 2, numViews());
-  canvas.drawString(hv, W - 12, 10);
+  canvas.drawString(hv, W - 12, 12);
   canvas.drawFastHLine(12, 40, W - 24, BLACK);
 
   if (g_apiKey.length() == 0) {
@@ -688,14 +736,12 @@ void drawWeatherCity(const m5::rtc_datetime_t& dt, int loc) {
   canvas.drawFastHLine(10, todayBottom, W - 20, BLACK);
   drawUpcomingRows(cc, 1, 3, todayBottom + 2, H - 22);
 
-  // Pie: hora de actualizacion + bateria
+  // Pie: hora de actualizacion (dcha) + icono de bateria (izq)
   canvas.setFont(&fonts::FreeSansBold12pt7b); canvas.setTextColor(BLACK);
   canvas.setTextDatum(bottom_right);
   char upd[24]; snprintf(upd, sizeof(upd), "AEMET %02d:%02d", cc.updH, cc.updM);
   canvas.drawString(upd, W - 8, H - 4);
-  int bat = M5.Power.getBatteryLevel();
-  char bs[12]; snprintf(bs, sizeof(bs), (bat < 0) ? "Bat --%%" : "Bat %d%%", bat);
-  canvas.setTextDatum(bottom_left); canvas.drawString(bs, 8, H - 4);
+  drawBatteryIcon(canvas, 10, H - 24);
   canvas.pushSprite(0, 0);
 }
 
@@ -916,9 +962,7 @@ void drawMusic() {
   // Cabecera
   canvas.setFont(&fonts::FreeSansBold18pt7b); canvas.setTextDatum(top_left); canvas.setTextColor(BLACK);
   canvas.drawString("MUSICA", 12, 8);
-  int bat = M5.Power.getBatteryLevel();
-  char bs[12]; snprintf(bs, sizeof(bs), (bat < 0) ? "Bat --%%" : "Bat %d%%", bat);
-  canvas.setTextDatum(top_right); canvas.drawString(bs, W - 12, 8);
+  drawBatteryIcon(canvas, W - 53, 8);
   canvas.drawFastHLine(12, 42, W - 24, BLACK);
 
   if (g_music.empty()) {
@@ -997,23 +1041,32 @@ void drawLibro() {
   }
   String name = trackName(g_books[g_bookIdx]);   // nombre sin ruta/extension
   canvas.drawString(name, LIB_MARGIN, 10);
-  canvas.setTextDatum(top_right);
-  int bat = M5.Power.getBatteryLevel();
-  char hdr[24]; snprintf(hdr, sizeof(hdr), "Bat %d%%", bat < 0 ? 0 : bat);
-  canvas.drawString(hdr, W - LIB_MARGIN, 10);
+  drawBatteryIcon(canvas, W - 53, 8);
   canvas.drawFastHLine(LIB_MARGIN, 44, W - 2 * LIB_MARGIN, BLACK);
 
   // Leer un trozo desde la posicion actual y paginar por palabras
   const int maxW = W - 2 * LIB_MARGIN;
   const int linesPerPage = (H - LIB_TOP - 34) / LIB_LINE_H;   // deja hueco para la ayuda
   File f = SD.open(g_books[g_bookIdx].c_str());
+  bool opened = (bool)f;
+  size_t fsz = 0;
   String chunk;
-  if (f) {
+  if (opened) {
+    fsz = f.size();
+    if (g_pageStart > fsz) g_pageStart = 0;       // offset invalido -> al principio
     f.seek(g_pageStart);
     const size_t CHUNK = 7000;
     chunk.reserve(CHUNK);
     for (size_t i = 0; i < CHUNK && f.available(); i++) chunk += (char)f.read();
     f.close();
+  }
+  Serial.printf("[LIBRO] %s open=%d size=%u start=%u read=%u\n",
+                g_books[g_bookIdx].c_str(), opened ? 1 : 0,
+                (unsigned)fsz, (unsigned)g_pageStart, (unsigned)chunk.length());
+  if (!opened || chunk.length() == 0) {
+    if (useBody) canvas.unloadFont();
+    drawCenteredMsg(opened ? "Fichero vacio o fin" : "No se pudo abrir", H / 2, RED, &fonts::FreeSansBold18pt7b);
+    canvas.pushSprite(0, 0); return;
   }
 
   int pos = 0, len = chunk.length(), y = LIB_TOP, linesDrawn = 0;
@@ -1126,7 +1179,8 @@ void drawCurrentMode() {
 }
 
 void applyEpdMode() {
-  M5.Display.setEpdMode(g_mode == MODE_CARRUSEL ? epd_mode_t::epd_quality : epd_mode_t::epd_fast);
+  // PRUEBA: todo en epd_fastest (mas rapido, mas ghosting) menos las fotos en calidad
+  M5.Display.setEpdMode(g_mode == MODE_CARRUSEL ? epd_mode_t::epd_quality : epd_mode_t::epd_fastest);
 }
 
 // ============================ MODO OCULTO: TV-B-Gone (IR) ============================
@@ -1208,7 +1262,7 @@ void setup() {
   delay(200);
   Serial.println("\n=== M5Paper Color - Estacion multimodo ===");
 
-  M5.Display.setEpdMode(epd_mode_t::epd_fast);
+  M5.Display.setEpdMode(epd_mode_t::epd_fastest);
   setPanelRotation(0);               // UI en vertical (400x600) + crea el lienzo
 
   pinMode(PIN_BTN_MODE, INPUT_PULLUP);
@@ -1262,6 +1316,8 @@ void setup() {
 
   last_sht_ms = millis();
   last_carousel_ms = millis();
+  g_lastInput = millis();
+  g_lastLocalUpdate = millis();
   g_needRedraw = true;
 }
 
@@ -1289,10 +1345,11 @@ void loop() {
     else if (btnDown.wasClicked())     musicVolUp();
   } else if (g_mode == MODE_LIBRO) {
     if (g_libState == LIB_LIST) {
-      // selector: UP/DOWN mueve, doble-click abre el libro
+      // selector: click simple mueve, doble-click abre. (wasSingleClicked evita mover en el
+      // primer click de un doble-click, que rompia la deteccion al redibujar la lista.)
       if (btnUp.wasDoubleClicked() || btnDown.wasDoubleClicked()) bookOpenSelected();
-      else if (btnUp.wasClicked())   listMove(-1);
-      else if (btnDown.wasClicked()) listMove(+1);
+      else if (btnUp.wasSingleClicked())   listMove(-1);
+      else if (btnDown.wasSingleClicked()) listMove(+1);
     } else {
       // lectura: UP/DOWN pasa pagina
       if (btnUp.wasClicked())   pagePrev();
@@ -1302,12 +1359,17 @@ void loop() {
     if (btnUp.wasPressed())   modeUp();      // resto de modos: respuesta inmediata
     if (btnDown.wasPressed()) modeDown();
   }
+  // Cualquier toque de boton reinicia el contador de inactividad (para el ahorro)
+  if (btnMode.isPressed() || btnUp.isPressed() || btnDown.isPressed()) g_lastInput = ms;
 
-  // Sensor + refresco de la vista LOCAL: cada 2 min (la pantalla queda fija entre medias)
-  if (ms - last_sht_ms >= SHT_UPDATE_MS) {
-    last_sht_ms = ms;
-    readSHT40();
-    if (g_mode == MODE_CLIMA && g_view == 0) g_needRedraw = true;
+  // Vista LOCAL: refresco PARCIAL cada minuto; tras 5 min sin tocar boton, cada 5 min (ahorro)
+  if (g_mode == MODE_CLIMA && g_view == 0 && !g_busy && !g_needRedraw) {
+    uint32_t interval = (ms - g_lastInput >= 300000UL) ? 300000UL : 60000UL;
+    if (ms - g_lastLocalUpdate >= interval) {
+      readSHT40();
+      updateLocalPartial(M5.Rtc.getDateTime());
+      g_lastLocalUpdate = ms;
+    }
   }
 
   // Carrusel automatico (infinito: g_img_idx siempre con modulo)
