@@ -163,10 +163,16 @@ IRsend irsend(IR_TX_PIN);
 
 // Clima
 int g_view = 0;   // 0=LOCAL, 1..N = ciudad (loc = g_view-1)
-struct ClimaDay { char fecha[12]; int wday, tMax, tMin, probLluvia, humMax, humMin; char cielo[40]; };
+struct ClimaDay {
+  char fecha[12]; int wday, tMax, tMin, probLluvia, humMax, humMin; char cielo[40];
+  int vientoVel, racha, uvMax;                     // viento km/h, racha km/h, indice UV
+  char vientoDir[5];                               // direccion del viento (N, NE, NO...)
+};
+struct ClimaHour { int hour, temp; char cielo[32]; };   // prevision por hora (icono + temp)
 struct ClimaCache {
   ClimaDay day[7]; int nDays; bool valid; int updH, updM;
   bool obsValid; float obsTemp, obsHum; char obsTime[6];
+  ClimaHour hour[6]; int nHours;                   // proximas horas (HOY)
 };
 std::vector<ClimaCache> g_clima;
 
@@ -408,6 +414,12 @@ bool aemetFetch(int idx) {
   dia["estadoCielo"][0]["periodo"] = true;
   dia["probPrecipitacion"][0]["value"] = true;
   dia["probPrecipitacion"][0]["periodo"] = true;
+  dia["viento"][0]["direccion"] = true;
+  dia["viento"][0]["velocidad"] = true;
+  dia["viento"][0]["periodo"] = true;
+  dia["rachaMax"][0]["value"] = true;
+  dia["rachaMax"][0]["periodo"] = true;
+  dia["uvMax"] = true;
 
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, h2.getStream(), DeserializationOption::Filter(filter));
@@ -426,7 +438,9 @@ bool aemetFetch(int idx) {
     cd.tMin = day["temperatura"]["minima"] | -99;
     cd.humMax = day["humedadRelativa"]["maxima"] | -1;
     cd.humMin = day["humedadRelativa"]["minima"] | -1;
+    cd.uvMax = day["uvMax"] | -1;
     cd.cielo[0] = 0; cd.probLluvia = 0;
+    cd.vientoVel = -1; cd.vientoDir[0] = 0; cd.racha = -1;
     for (JsonObject e : day["estadoCielo"].as<JsonArray>()) {
       const char* per = e["periodo"] | ""; const char* des = e["descripcion"] | "";
       if (strlen(des) && (strcmp(per, "00-24") == 0 || cd.cielo[0] == 0))
@@ -436,6 +450,21 @@ bool aemetFetch(int idx) {
       const char* per = p["periodo"] | "";
       if (strcmp(per, "00-24") == 0) { cd.probLluvia = p["value"] | 0; break; }
       cd.probLluvia = p["value"] | cd.probLluvia;
+    }
+    // Viento (direccion + velocidad) y racha maxima: preferimos el periodo de dia completo "00-24"
+    for (JsonObject v : day["viento"].as<JsonArray>()) {
+      const char* per = v["periodo"] | "";
+      if (strcmp(per, "00-24") == 0 || cd.vientoVel < 0) {
+        cd.vientoVel = v["velocidad"] | 0;
+        strlcpy(cd.vientoDir, v["direccion"] | "", sizeof(cd.vientoDir));
+        if (strcmp(per, "00-24") == 0) break;
+      }
+    }
+    for (JsonObject r : day["rachaMax"].as<JsonArray>()) {
+      const char* per = r["periodo"] | "";
+      int val = atoi(r["value"] | "0");           // rachaMax llega como cadena
+      if (strcmp(per, "00-24") == 0) { cd.racha = val; break; }
+      if (cd.racha < 0) cd.racha = val;
     }
     cc.nDays++;
   }
@@ -487,7 +516,96 @@ bool aemetFetchObs(int idx) {
   return cc.obsValid;
 }
 
-// Descarga (NTP + prediccion + observacion) de todas las ubicaciones.
+// Buffer en PSRAM que actua como Stream de escritura: para volcar el cuerpo HTTP COMPLETO
+// (HTTPClient::writeToStream de-trocea el "chunked") y parsear el JSON despues, evitando el
+// IncompleteInput que daba al parsear el stream directamente en respuestas grandes.
+struct PsBuf : public Stream {
+  char* data = nullptr; size_t len = 0, cap = 0; bool ok = true;
+  ~PsBuf() { if (data) free(data); }
+  size_t write(uint8_t b) override { return write(&b, 1); }
+  size_t write(const uint8_t* p, size_t n) override {
+    if (!ok) return 0;
+    if (len + n + 1 > cap) {
+      size_t ncap = cap ? cap : 16384;
+      while (len + n + 1 > ncap) ncap += ncap / 2 + 1;
+      char* nb = (char*)ps_realloc(data, ncap);
+      if (!nb) { ok = false; return 0; }
+      data = nb; cap = ncap;
+    }
+    memcpy(data + len, p, n); len += n; data[len] = 0; return n;
+  }
+  int available() override { return 0; }
+  int read() override { return -1; }
+  int peek() override { return -1; }
+  void flush() override {}
+};
+
+// Prediccion HORARIA: rellena cc.hour[] con las proximas horas (icono + temperatura).
+bool aemetFetchHoraria(int idx) {
+  if (g_apiKey.length() == 0) return false;
+  String url = String("https://opendata.aemet.es/opendata/api/prediccion/especifica/municipio/horaria/")
+             + g_locs[idx].municipio + "?api_key=" + g_apiKey;
+  WiFiClientSecure c1; c1.setInsecure();
+  HTTPClient h1; h1.setTimeout(20000); h1.setConnectTimeout(15000);
+  if (!h1.begin(c1, url)) { Serial.println("HORARIA: begin paso1 fallo"); return false; }
+  int code1 = h1.GET();
+  if (code1 != 200) { Serial.printf("HORARIA paso1 HTTP %d\n", code1); h1.end(); return false; }
+  JsonDocument meta; deserializeJson(meta, h1.getStream()); h1.end();
+  String datos = meta["datos"] | "";
+  if (datos.isEmpty()) { Serial.println("HORARIA: sin URL de datos"); return false; }
+
+  WiFiClientSecure c2; c2.setInsecure();
+  HTTPClient h2; h2.setTimeout(20000); h2.setConnectTimeout(15000);   // horaria es grande: mas timeout
+  if (!h2.begin(c2, datos)) { Serial.println("HORARIA: begin paso2 fallo"); return false; }
+  int code2 = h2.GET();
+  if (code2 != 200) { Serial.printf("HORARIA paso2 HTTP %d\n", code2); h2.end(); return false; }
+
+  // Volcar el cuerpo completo a PSRAM (de-trocea) y parsear desde ahi.
+  PsBuf pb;
+  h2.writeToStream(&pb);
+  h2.end();
+  if (!pb.ok || pb.len == 0) { Serial.printf("HORARIA: lectura incompleta (%u bytes)\n", (unsigned)pb.len); return false; }
+
+  JsonDocument filter;
+  JsonObject dia = filter[0]["prediccion"]["dia"][0].to<JsonObject>();
+  dia["temperatura"][0]["value"]      = true;
+  dia["temperatura"][0]["periodo"]    = true;
+  dia["estadoCielo"][0]["descripcion"] = true;
+  dia["estadoCielo"][0]["periodo"]    = true;
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, pb.data, pb.len, DeserializationOption::Filter(filter));
+  if (err) { Serial.printf("HORARIA JSON err: %s (%u bytes)\n", err.c_str(), (unsigned)pb.len); return false; }
+
+  int nDias = doc[0]["prediccion"]["dia"].as<JsonArray>().size();
+  int curHour = M5.Rtc.getDateTime().time.hours;
+  ClimaCache& cc = g_clima[idx];
+  cc.nHours = 0;
+  int diaIdx = 0;
+  for (JsonObject dia2 : doc[0]["prediccion"]["dia"].as<JsonArray>()) {
+    bool today = (diaIdx == 0);
+    for (JsonObject te : dia2["temperatura"].as<JsonArray>()) {
+      if (cc.nHours >= 5) break;
+      const char* per = te["periodo"] | "";
+      int h = atoi(per);
+      if (today && h <= curHour) continue;          // solo las horas que quedan de hoy
+      ClimaHour& ch = cc.hour[cc.nHours];
+      ch.hour = h;
+      ch.temp = te["value"].as<int>();               // value puede llegar como cadena o numero
+      ch.cielo[0] = 0;
+      for (JsonObject ec : dia2["estadoCielo"].as<JsonArray>()) {
+        if (strcmp(ec["periodo"] | "", per) == 0) { strlcpy(ch.cielo, ec["descripcion"] | "", sizeof(ch.cielo)); break; }
+      }
+      cc.nHours++;
+    }
+    if (cc.nHours >= 5) break;
+    diaIdx++;
+  }
+  Serial.printf("HORARIA %s: %d horas (dias=%d, horaActual=%d)\n", g_locs[idx].name.c_str(), cc.nHours, nDias, curHour);
+  return cc.nHours > 0;
+}
+
+// Descarga (NTP + prediccion + observacion + horaria) de todas las ubicaciones.
 // Sin aviso si no hay WiFi: el clima ya delata el fallo (sin datos / hora de actualizacion vieja).
 void fetchAllOnline(bool withNtp) {
   if (!connectWiFi()) return;
@@ -497,6 +615,7 @@ void fetchAllOnline(bool withNtp) {
       Serial.printf("Descargando %s...\n", g_locs[i].name.c_str());
       aemetFetch(i);
       aemetFetchObs(i);
+      aemetFetchHoraria(i);
     }
   }
   wifiOff();
@@ -565,33 +684,74 @@ int drawWrapped(const char* text, int x, int y, int maxW, int lineH) {
   return yy;
 }
 
-// Bloque destacado de HOY (icono grande + cielo + max/min + lluvia + humedad).
+// Color del indice UV segun la paleta del panel (Spectra 6): bajo=verde, moderado=amarillo, alto=rojo.
+uint16_t uvColor(int uv) { return (uv <= 2) ? GREEN : (uv <= 5) ? YELLOW : RED; }
+
+// Tira de prevision por horas (proximas horas): hora + icono pequeno + temperatura, en N columnas.
+void drawHourly(ClimaCache& cc, int y0) {
+  if (cc.nHours <= 0) return;
+  const int W = M5.Display.width();
+  int n = cc.nHours > 5 ? 5 : cc.nHours;
+  int cw = W / n;
+  for (int i = 0; i < n; i++) {
+    ClimaHour& h = cc.hour[i];
+    int cx = cw * i + cw / 2;
+    if (i > 0) canvas.drawFastVLine(cw * i, y0 + 2, 70, BLACK);   // separador entre columnas
+    char hl[8]; snprintf(hl, sizeof(hl), "%dh", h.hour);
+    canvas.setFont(&fonts::FreeSansBold12pt7b); canvas.setTextDatum(top_center); canvas.setTextColor(BLACK);
+    canvas.drawString(hl, cx, y0);
+    drawWeatherIcon(cx, y0 + 33, 13, h.cielo);
+    char tt[8]; snprintf(tt, sizeof(tt), "%dC", h.temp);
+    canvas.setTextDatum(bottom_center); canvas.setTextColor(BLACK);
+    canvas.drawString(tt, cx, y0 + 73);
+  }
+}
+
+// Bloque destacado de HOY: icono + temps + UV + cielo + viento + lluvia + humedad + tira horaria.
 void drawToday(ClimaCache& cc, int top, int bottom) {
   const int W = M5.Display.width();
   ClimaDay& d = cc.day[0];
   canvas.setFont(&fonts::FreeSansBold18pt7b); canvas.setTextDatum(top_left); canvas.setTextColor(BLACK);
   canvas.drawString("HOY", 12, top);
 
-  drawWeatherIcon(66, (top + bottom) / 2 + 6, 42, d.cielo);
+  drawWeatherIcon(60, top + 92, 34, d.cielo);
 
-  int rx = 132;
+  int rx = 128;
   // Temperaturas grandes max/min
   canvas.setFont(&fonts::FreeSansBold24pt7b); canvas.setTextDatum(top_left);
   char s[8];
   snprintf(s, sizeof(s), "%d", d.tMax);
-  canvas.setTextColor(RED);   canvas.drawString(s, rx, top + 22); int wmax = canvas.textWidth(s);
-  canvas.setTextColor(BLACK); canvas.drawString(" / ", rx + wmax, top + 22); int wsl = canvas.textWidth(" / ");
+  canvas.setTextColor(RED);   canvas.drawString(s, rx, top + 14); int wmax = canvas.textWidth(s);
+  canvas.setTextColor(BLACK); canvas.drawString(" / ", rx + wmax, top + 14); int wsl = canvas.textWidth(" / ");
   snprintf(s, sizeof(s), "%d", d.tMin);
-  canvas.setTextColor(BLUE);  canvas.drawString(s, rx + wmax + wsl, top + 22);
-  canvas.setFont(&fonts::FreeSansBold12pt7b); canvas.setTextColor(BLACK);
-  canvas.drawString("max / min  C", rx, top + 60);
-  // Cielo (con salto)
-  drawWrapped(d.cielo, rx, top + 86, W - rx - 10, 22);
-  // Lluvia + humedad anclados abajo
+  canvas.setTextColor(BLUE);  canvas.drawString(s, rx + wmax + wsl, top + 14);
+
+  canvas.setFont(&fonts::FreeSansBold12pt7b); canvas.setTextDatum(top_left); canvas.setTextColor(BLACK);
+  canvas.drawString("max / min  C", rx, top + 50);
+  // UV (a la derecha, color segun nivel)
+  if (d.uvMax >= 0) {
+    char uvs[12]; snprintf(uvs, sizeof(uvs), "UV %d", d.uvMax);
+    canvas.setTextDatum(top_right); canvas.setTextColor(uvColor(d.uvMax));
+    canvas.drawString(uvs, W - 10, top + 50);
+    canvas.setTextDatum(top_left); canvas.setTextColor(BLACK);
+  }
+  // Cielo en una linea (el icono ya lo ilustra)
+  { char cl[28]; strlcpy(cl, d.cielo, sizeof(cl)); canvas.drawString(cl, rx, top + 74); }
+  // Viento (subido: justo bajo el cielo)
+  if (d.vientoVel >= 0) {
+    char vt[36];
+    if (d.racha > 0) snprintf(vt, sizeof(vt), "Viento %s %d (r%d) km/h", d.vientoDir, d.vientoVel, d.racha);
+    else             snprintf(vt, sizeof(vt), "Viento %s %d km/h", d.vientoDir, d.vientoVel);
+    canvas.drawString(vt, rx, top + 98);
+  }
+  // Lluvia + humedad
   canvas.setTextColor(BLUE);
   char lab[28]; snprintf(lab, sizeof(lab), "Lluvia %d%%", d.probLluvia);
-  canvas.drawString(lab, rx, bottom - 44);
-  if (d.humMax >= 0) { char hr[28]; snprintf(hr, sizeof(hr), "Humedad %d-%d%%", d.humMin, d.humMax); canvas.drawString(hr, rx, bottom - 22); }
+  canvas.drawString(lab, rx, top + 122);
+  if (d.humMax >= 0) { char hr[28]; snprintf(hr, sizeof(hr), "Humedad %d-%d%%", d.humMin, d.humMax); canvas.drawString(hr, rx, top + 144); }
+
+  // Tira de las proximas horas, a todo el ancho, antes de las filas de los proximos dias
+  drawHourly(cc, bottom - 80);
 }
 
 // Filas compactas de los proximos dias (icono + dia + cielo + max/min + lluvia).
@@ -725,8 +885,8 @@ void drawWeatherCity(const m5::rtc_datetime_t& dt, int loc) {
     canvas.pushSprite(0, 0); return;
   }
 
-  // HOY destacado + 3 proximos dias
-  int todayBottom = top + 178;
+  // HOY destacado (con tira de proximas horas) + proximos dias
+  int todayBottom = top + 250;
   drawToday(cc, top, todayBottom);
   canvas.drawFastHLine(10, todayBottom, W - 20, BLACK);
   drawUpcomingRows(cc, 1, 3, todayBottom + 2, H - 22);
@@ -1056,7 +1216,12 @@ void drawLibro() {
 
   // Leer un trozo desde la posicion actual y paginar por palabras
   const int maxW = W - 2 * LIB_MARGIN;
-  const int linesPerPage = (H - LIB_TOP - 34) / LIB_LINE_H;   // deja hueco para la ayuda
+  // Alto de linea segun la fuente realmente cargada: un body.vlw mas pequeno (p.ej. 18px)
+  // da automaticamente mas lineas por pagina. Para la fuente integrada se usa LIB_LINE_H.
+  int fh = useBody ? canvas.fontHeight() : 0;
+  if (fh < 10 || fh > 80) fh = 22;                           // salvaguarda ante valores raros
+  const int lineH = useBody ? (fh + 6) : LIB_LINE_H;
+  const int linesPerPage = (H - LIB_TOP - 34) / lineH;        // deja hueco para la ayuda
   File f = SD.open(g_books[g_bookIdx].c_str());
   bool opened = (bool)f;
   size_t fsz = 0;
@@ -1083,7 +1248,7 @@ void drawLibro() {
   canvas.setTextDatum(top_left); canvas.setTextColor(BLACK);
   while (linesDrawn < linesPerPage && pos < len) {
     if (chunk[pos] == '\r') { pos++; continue; }
-    if (chunk[pos] == '\n') { pos++; y += LIB_LINE_H; linesDrawn++; continue; }  // parrafo / linea en blanco
+    if (chunk[pos] == '\n') { pos++; y += lineH; linesDrawn++; continue; }  // parrafo / linea en blanco
     String line; int linePos = pos;
     while (linePos < len && chunk[linePos] != '\n') {
       int ws = linePos; while (ws < len && chunk[ws] != ' ' && chunk[ws] != '\n') ws++;  // palabra
@@ -1097,7 +1262,7 @@ void drawLibro() {
     canvas.drawString(line, LIB_MARGIN, y);
     pos = linePos;
     if (pos < len && chunk[pos] == '\n') pos++;   // consume el salto que cierra la linea
-    y += LIB_LINE_H; linesDrawn++;
+    y += lineH; linesDrawn++;
   }
   g_nextPageStart = g_pageStart + pos;
 

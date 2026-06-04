@@ -19,7 +19,8 @@
 ## ✨ Características
 
 - 🌦️ **Clima** — temperatura/humedad interior (SHT40) + **predicción AEMET** de varias localidades
-  (hoy destacado con icono a color + 3 días) + **observación en tiempo real** de una estación AEMET.
+  (hoy destacado: icono a color, máx/mín, **sensación térmica**, **viento + racha**, **índice UV**,
+  lluvia y humedad + 3 días) + **observación en tiempo real** de una estación AEMET.
   Vista **LOCAL** con fecha, reloj grande y batería.
 - 🖼️ **Carrusel de fotos** — imágenes de la microSD a pantalla completa, con **auto-rotación del
   panel** según la orientación de cada foto.
@@ -163,10 +164,14 @@ La solución es una fuente **VLW** (bitmap, generada de un TTF) que se carga des
 
 ```
 python tools/make_vlw.py "C:\Windows\Fonts\verdanab.ttf" 44 fonts/title.vlw
+python tools/make_vlw.py "C:\Windows\Fonts\verdana.ttf"  18 fonts/body.vlw
 ```
 
-Copia el `fonts/title.vlw` resultante a la microSD (`/fonts/title.vlw`). Si no existe, se usa una
-fuente integrada (sin acentos). El `.vlw` no se versiona (puede derivar de una fuente propietaria).
+Copia los `.vlw` resultantes a la microSD (`/fonts/`). Si no existen, se usa una fuente integrada
+(sin acentos). El `.vlw` no se versiona (puede derivar de una fuente propietaria).
+
+> 📖 **Lector de libros:** el alto de línea se ajusta **automáticamente** al tamaño de `body.vlw`.
+> Generándolo a **18 px** (en vez de 22) entran **más líneas por página** sin tocar el código.
 
 ---
 
@@ -292,6 +297,8 @@ pio device monitor  # monitor serie
 - [x] Refresco LOCAL con cadencia inteligente (1 min; 5 min en reposo)
 - [x] Arranque rápido (pantalla local inmediata; WiFi/NTP/AEMET en segundo plano)
 - [x] Bajo consumo: *light sleep* en reposo + apagado por PMIC tras inactividad
+- [x] HOY ampliado: sensación térmica, viento + racha, índice UV
+- [x] Lector: alto de línea automático según el tamaño de `body.vlw`
 - [ ] Modo libro **EPUB** (descompresión ZIP + extracción de texto)
 - [ ] *Core 0* para refrescar sin bloquear botones durante los ~12 s de refresco
 - [ ] Alarma RTC para encender a una hora programada
