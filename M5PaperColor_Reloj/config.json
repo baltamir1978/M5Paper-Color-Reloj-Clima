@@ -21,6 +21,12 @@
   "photo_auto_rotate": true,
   "deep_sleep_minutes": 60,
 
+  "_modos": "Activa/desactiva modos. Un modo en false no se ejecuta y se salta al pulsar G1.",
+  "modos": { "clima": true, "carrusel": true, "musica": true, "libro": true, "wifi": true },
+
+  "_wifi_modo": "Modo WiFi: crea un AP propio y un gestor web de la SD. ap_pass min 8 caracteres.",
+  "wifi_modo": { "ap_ssid": "PaperColor", "ap_pass": "papercolor1234", "user": "admin", "pass": "admin" },
+
   "locations": [
     { "name": "Madrid",           "municipio": "28079", "estacion": "3126Y" },
     { "name": "San Ildefonso",    "municipio": "40181", "estacion": "" },

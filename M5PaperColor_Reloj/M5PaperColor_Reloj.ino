@@ -2,11 +2,13 @@
  * ============================================================================
  *  M5Paper Color (ESP32-S3) - Estacion multimodo
  * ============================================================================
- *  4 modos (boton G1, 1 click para rotar):
+ *  Hasta 5 modos (boton G1, 1 click para rotar; cada uno activable en config "modos"):
  *    1 CLIMA   : vistas Up/Down -> LOCAL (fecha/hora + sensor) + ciudades AEMET
  *    2 CARRUSEL: fotos de la microSD a pantalla completa
  *    3 MUSICA  : reproductor MP3/M4A de la SD (controles tipo iPod Shuffle)
  *    4 LIBRO   : lector de TXT (lista de /Libros, recuerda la pagina de cada uno)
+ *    5 WIFI    : (arranca apagado; UP enciende/DOWN apaga) AP propio + QR + gestor web de la SD
+ *               (navegar/subir/bajar/editar/borrar + galeria + video ligero con HTTP Range/206)
  *  Modo oculto: G1 doble-click = TV-B-Gone (IR), feedback con el LED RGB.
  *
  *  TODA la configuracion va en /config.json de la microSD (ver ejemplo en el
@@ -39,6 +41,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <WebServer.h>      // modo WiFi: gestor de la SD por web (AP propio)
 #include <ArduinoJson.h>
 #include <esp_sntp.h>
 #include <sntp.h>
@@ -53,6 +56,7 @@
 #include <IRremoteESP8266.h>
 #include <IRsend.h>
 #include "tvbgone_codes.h"   // base de codigos TV-B-Gone (modo oculto)
+#include "wifi_page.h"       // HTML del modo WiFi (raw string; en .h para no romper el preprocesador .ino)
 
 // Declaraciones adelantadas (el IDE de Arduino inserta los prototipos auto-
 // generados tras los #include, antes de los struct; esto evita el error).
@@ -75,6 +79,10 @@ static constexpr int SD_SCK_PIN = 15, SD_MISO_PIN = 14, SD_MOSI_PIN = 13, SD_CS_
 #define CONFIG_PATH "/config.json"
 #define DEF_FOTOS_DIR  "/Fotos"
 #define DEF_MUSICA_DIR "/Musica"
+#define DEF_AP_SSID  "PaperColor"        // modo WiFi: SSID del AP por defecto (config wifi_modo.ap_ssid)
+#define DEF_AP_PASS  "papercolor1234"    // clave del AP por defecto, >=8 chars (wifi_modo.ap_pass)
+#define DEF_WEB_USER "admin"             // login web por defecto (wifi_modo.user)
+#define DEF_WEB_PASS "admin"             // login web por defecto (wifi_modo.pass)
 
 // ============================ CONFIG (cargada de la SD) ============================
 struct WifiCred { String ssid, pass; };
@@ -91,12 +99,26 @@ String   g_librosDir = "/Libros";                // carpeta de libros (modo 4)
 String   g_titleFontPath = "/fonts/title.vlw";   // fuente VLW con acentos para titulos
 bool     g_photoAutoRotate = true;   // girar el panel segun la orientacion de la foto
 
+// Modo WiFi (gestor de la SD por web, AP propio estilo "nomad")
+WebServer g_server(80);
+File      g_upFile;                              // fichero en curso durante una subida
+bool      g_wifiModeOn = false;
+String    g_apSsid  = DEF_AP_SSID;               // SSID del AP (config wifi_modo.ap_ssid)
+String    g_apPass  = DEF_AP_PASS;               // clave del AP (>=8 chars; wifi_modo.ap_pass)
+String    g_webUser = DEF_WEB_USER;              // login web (wifi_modo.user)
+String    g_webPass = DEF_WEB_PASS;              // login web (wifi_modo.pass)
+
+// enum Mode ANTES de cualquier funcion: Arduino autogenera el prototipo de
+// nextEnabledMode(Mode) y lo coloca antes de la 1a funcion del sketch (numLocs),
+// asi que el tipo Mode debe estar ya definido aqui arriba.
+enum Mode { MODE_CLIMA = 0, MODE_CARRUSEL, MODE_MUSICA, MODE_LIBRO, MODE_WIFI, MODE_COUNT };
+const char* MODE_NAMES[] = {"CLIMA", "CARRUSEL", "MUSICA", "LIBRO", "WIFI"};
+bool g_modeEnabled[MODE_COUNT] = {true, true, true, true, true};  // activar/desactivar modos (config "modos")
+
 int numLocs()  { return (int)g_locs.size(); }
 int numViews() { return numLocs() + 1; }   // vista 0 = LOCAL
 
 // ============================ ESTADO GLOBAL ============================
-enum Mode { MODE_CLIMA = 0, MODE_CARRUSEL, MODE_MUSICA, MODE_LIBRO, MODE_COUNT };
-const char* MODE_NAMES[] = {"CLIMA", "CARRUSEL", "MUSICA", "LIBRO"};
 
 M5Canvas   canvas(&M5.Display);
 M5PM1      pm1;
@@ -189,6 +211,8 @@ void loadDefaults() {
   g_bodyFontPath  = "/fonts/body.vlw";
   g_photoAutoRotate = true;
   g_deepSleepMs = 3600000UL;   // 60 min
+  for (int i = 0; i < MODE_COUNT; i++) g_modeEnabled[i] = true;
+  g_apSsid = DEF_AP_SSID; g_apPass = DEF_AP_PASS; g_webUser = DEF_WEB_USER; g_webPass = DEF_WEB_PASS;
   g_locs.clear();
   g_locs.push_back({"Madrid",           "28079", "3126Y"});  // obs El Goloso
   g_locs.push_back({"San Ildefonso",    "40181", ""});
@@ -221,6 +245,19 @@ bool loadConfig() {
   if (doc["font_body"].is<const char*>())  g_bodyFontPath  = (const char*)doc["font_body"];
   if (doc["photo_auto_rotate"].is<bool>()) g_photoAutoRotate = doc["photo_auto_rotate"];
   if (doc["deep_sleep_minutes"].is<int>()) g_deepSleepMs = (uint32_t)doc["deep_sleep_minutes"] * 60000UL;
+  // Modos activos (si falta la clave -> activo). Si quedan TODOS desactivados, se reactivan todos.
+  g_modeEnabled[MODE_CLIMA]    = doc["modos"]["clima"]    | true;
+  g_modeEnabled[MODE_CARRUSEL] = doc["modos"]["carrusel"] | true;
+  g_modeEnabled[MODE_MUSICA]   = doc["modos"]["musica"]   | true;
+  g_modeEnabled[MODE_LIBRO]    = doc["modos"]["libro"]    | true;
+  g_modeEnabled[MODE_WIFI]     = doc["modos"]["wifi"]     | true;
+  if (doc["wifi_modo"]["ap_ssid"].is<const char*>()) g_apSsid  = (const char*)doc["wifi_modo"]["ap_ssid"];
+  if (doc["wifi_modo"]["ap_pass"].is<const char*>()) g_apPass  = (const char*)doc["wifi_modo"]["ap_pass"];
+  if (doc["wifi_modo"]["user"].is<const char*>())    g_webUser = (const char*)doc["wifi_modo"]["user"];
+  if (doc["wifi_modo"]["pass"].is<const char*>())    g_webPass = (const char*)doc["wifi_modo"]["pass"];
+  { bool any = false; for (int i = 0; i < MODE_COUNT; i++) any |= g_modeEnabled[i];
+    if (!any) { for (int i = 0; i < MODE_COUNT; i++) g_modeEnabled[i] = true;
+                Serial.println("config: todos los modos desactivados -> reactivo todos"); } }
   // Ubicaciones
   g_locs.clear();
   for (JsonObject l : doc["locations"].as<JsonArray>()) {
@@ -1308,6 +1345,245 @@ void drawLibroList() {
   canvas.pushSprite(0, 0);
 }
 
+// ============================ MODO 5: WIFI (gestor de la SD por web, AP propio) ============================
+// Levanta un AP propio (estilo "nomad") + servidor web con login para navegar, descargar, subir,
+// borrar y editar ficheros de la microSD. Solo activo en este modo (fuera, WiFi apagado).
+// La pagina web (WIFI_HTML) va en wifi_page.h (incluido arriba) para no romper el preprocesador .ino.
+
+bool webAuth() {
+  if (g_server.authenticate(g_webUser.c_str(), g_webPass.c_str())) return true;
+  g_server.requestAuthentication();
+  return false;
+}
+static String jsonEsc(const String& s) {
+  String o; for (size_t i = 0; i < s.length(); i++) { char c = s[i];
+    if (c == '"' || c == '\\') { o += '\\'; o += c; } else if (c == '\n') o += "\\n"; else o += c; }
+  return o;
+}
+static String webContentType(const String& p) {
+  String n = p; n.toLowerCase();
+  if (n.endsWith(".jpg") || n.endsWith(".jpeg")) return "image/jpeg";
+  if (n.endsWith(".png")) return "image/png";
+  if (n.endsWith(".gif")) return "image/gif";
+  if (n.endsWith(".bmp")) return "image/bmp";
+  if (n.endsWith(".webp")) return "image/webp";
+  if (n.endsWith(".mp4") || n.endsWith(".m4v")) return "video/mp4";
+  if (n.endsWith(".mov")) return "video/quicktime";
+  if (n.endsWith(".webm")) return "video/webm";
+  if (n.endsWith(".mkv")) return "video/x-matroska";
+  if (n.endsWith(".txt")||n.endsWith(".json")||n.endsWith(".csv")||n.endsWith(".md")||n.endsWith(".log")||
+      n.endsWith(".cfg")||n.endsWith(".ino")||n.endsWith(".h")||n.endsWith(".c")||n.endsWith(".js")||n.endsWith(".xml"))
+    return "text/plain; charset=utf-8";
+  return "application/octet-stream";
+}
+
+void handleRoot() { if (!webAuth()) return; g_server.send_P(200, "text/html", WIFI_HTML); }
+
+void handleList() {
+  if (!webAuth()) return;
+  String dir = g_server.hasArg("dir") ? g_server.arg("dir") : "/";
+  File d = SD.open(dir);
+  String out = "[";
+  if (d && d.isDirectory()) {
+    bool first = true;
+    for (File f = d.openNextFile(); f; f = d.openNextFile()) {
+      String nm = f.name(); int sl = nm.lastIndexOf('/'); if (sl >= 0) nm = nm.substring(sl + 1);
+      if (!first) out += ","; first = false;
+      out += "{\"name\":\"" + jsonEsc(nm) + "\",\"size\":" + String((uint32_t)f.size()) +
+             ",\"dir\":" + (f.isDirectory() ? "true" : "false") + "}";
+      f.close();
+    }
+  }
+  if (d) d.close();
+  out += "]";
+  g_server.send(200, "application/json", out);
+}
+
+// Sirve un fichero. Soporta HTTP Range (206) para streaming/seek de video y descargas grandes.
+// ?dl=1 fuerza descarga (Content-Disposition); sin ello se sirve inline (ver imagen/video en el navegador).
+void handleDl() {
+  if (!webAuth()) return;
+  String path = g_server.arg("path");
+  File f = SD.open(path, FILE_READ);
+  if (!f || f.isDirectory()) { if (f) f.close(); g_server.send(404, "text/plain", "no existe"); return; }
+  size_t fileSize = f.size();
+  String type = webContentType(path);
+
+  if (g_server.hasArg("dl")) {
+    String base = path; int sl = base.lastIndexOf('/'); if (sl >= 0) base = base.substring(sl + 1);
+    g_server.sendHeader("Content-Disposition", "attachment; filename=\"" + base + "\"");
+  }
+  g_server.sendHeader("Accept-Ranges", "bytes");
+
+  // Range: bytes=ini-fin  (requiere collectHeaders("Range") en startWifiMode)
+  size_t startByte = 0, endByte = (fileSize > 0) ? fileSize - 1 : 0;
+  bool partial = false;
+  if (g_server.hasHeader("Range")) {
+    String r = g_server.header("Range");
+    if (r.startsWith("bytes=")) {
+      int dash = r.indexOf('-');
+      if (dash >= 6) startByte = (size_t) r.substring(6, dash).toInt();
+      String es = r.substring(dash + 1); es.trim();
+      if (es.length()) endByte = (size_t) es.toInt();
+      if (endByte >= fileSize) endByte = (fileSize > 0) ? fileSize - 1 : 0;
+      if (endByte >= startByte + (2 * 1024 * 1024)) endByte = startByte + (2 * 1024 * 1024) - 1;  // 2 MB/respuesta
+      partial = (fileSize > 0 && startByte <= endByte && startByte < fileSize);
+    }
+  }
+
+  static uint8_t buf[8192];
+  if (partial) {
+    size_t len = endByte - startByte + 1;
+    f.seek(startByte);
+    g_server.sendHeader("Content-Range", "bytes " + String((uint32_t)startByte) + "-" +
+                        String((uint32_t)endByte) + "/" + String((uint32_t)fileSize));
+    g_server.setContentLength(len);
+    g_server.send(206, type, "");
+    WiFiClient client = g_server.client();
+    size_t rem = len;
+    while (rem > 0 && client.connected()) {
+      size_t n = f.read(buf, rem < sizeof(buf) ? rem : sizeof(buf));
+      if (n == 0) break;
+      client.write(buf, n);
+      rem -= n;
+    }
+  } else {
+    g_server.streamFile(f, type);     // fichero completo (imagenes, ficheros pequenos)
+  }
+  f.close();
+}
+
+void handleRm() {
+  if (!webAuth()) return;
+  String path = g_server.arg("path");
+  bool ok = false;
+  File f = SD.open(path);
+  if (f) { bool isd = f.isDirectory(); f.close(); ok = isd ? SD.rmdir(path) : SD.remove(path); }
+  g_server.send(ok ? 200 : 500, "text/plain", ok ? "ok" : "error");
+}
+
+void handleMkdir() {
+  if (!webAuth()) return;
+  bool ok = SD.mkdir(g_server.arg("path"));
+  g_server.send(ok ? 200 : 500, "text/plain", ok ? "ok" : "error");
+}
+
+void handleSave() {
+  if (!webAuth()) return;
+  File f = SD.open(g_server.arg("path"), FILE_WRITE);
+  if (!f) { g_server.send(500, "text/plain", "no se pudo abrir"); return; }
+  f.print(g_server.arg("data"));
+  f.close();
+  g_server.send(200, "text/plain", "ok");
+}
+
+void handleUpload() {
+  HTTPUpload& u = g_server.upload();
+  if (u.status == UPLOAD_FILE_START) {
+    String dir = g_server.hasArg("dir") ? g_server.arg("dir") : "/";
+    if (!dir.endsWith("/")) dir += "/";
+    String path = dir + u.filename;
+    if (g_upFile) g_upFile.close();
+    g_upFile = SD.open(path.c_str(), FILE_WRITE);
+    Serial.printf("[WIFI] subiendo %s\n", path.c_str());
+  } else if (u.status == UPLOAD_FILE_WRITE) {
+    if (g_upFile) g_upFile.write(u.buf, u.currentSize);
+  } else if (u.status == UPLOAD_FILE_END) {
+    if (g_upFile) g_upFile.close();
+  }
+}
+
+void startWifiMode() {
+  audioPowerOff();
+  g_bootFetchPending = false;               // en modo AP no se hace la descarga STA de arranque
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_AP);
+  bool ok = WiFi.softAP(g_apSsid.c_str(), g_apPass.length() >= 8 ? g_apPass.c_str() : nullptr);
+  g_server.on("/", handleRoot);
+  g_server.on("/list", handleList);
+  g_server.on("/dl", handleDl);
+  g_server.on("/rm", handleRm);
+  g_server.on("/mkdir", handleMkdir);
+  g_server.on("/save", HTTP_POST, handleSave);
+  g_server.on("/up", HTTP_POST, []() { g_server.send(200, "text/plain", "ok"); }, handleUpload);
+  g_server.onNotFound([]() { g_server.send(404, "text/plain", "404"); });
+  static const char* HK[] = { "Range" };       // sin esto, hasHeader("Range") siempre seria false
+  g_server.collectHeaders(HK, 1);
+  g_server.begin();
+  g_wifiModeOn = true;
+  Serial.printf("[WIFI] AP '%s' (%s) -> http://192.168.4.1  login=%s\n",
+                g_apSsid.c_str(), ok ? "ok" : "FALLO", g_webUser.c_str());
+}
+
+void stopWifiMode() {
+  if (!g_wifiModeOn) return;
+  g_server.stop();
+  if (g_upFile) g_upFile.close();        // cierra una subida a medias (deja la SD sin handles abiertos)
+  WiFi.softAPdisconnect(true);           // tira el AP
+  WiFi.mode(WIFI_OFF);                    // WiFi totalmente apagado
+  g_wifiModeOn = false;
+  Serial.println("[WIFI] AP detenido, SD libre.");
+}
+
+// Escapa el SSID/clave para la cadena QR de WiFi (\ ; , : " se preceden de \).
+static String wifiQrEsc(const String& s) {
+  String o; for (size_t i = 0; i < s.length(); i++) { char c = s[i];
+    if (c=='\\'||c==';'||c==','||c==':'||c=='"') o += '\\'; o += c; }
+  return o;
+}
+void drawWifi() {
+  const int W = M5.Display.width(), H = M5.Display.height();
+  canvas.fillSprite(WHITE);
+  canvas.setFont(&fonts::FreeSansBold18pt7b); canvas.setTextDatum(top_left); canvas.setTextColor(BLACK);
+  canvas.drawString("WIFI", 12, 8);
+  drawBatteryIcon(canvas, W - 53, 8);
+  canvas.drawFastHLine(12, 42, W - 24, BLACK);
+
+  if (!g_wifiModeOn) {
+    // -------- AP APAGADO --------
+    canvas.setTextDatum(top_center);
+    canvas.setFont(&fonts::FreeSansBold18pt7b); canvas.setTextColor(BLACK);
+    canvas.drawString("Punto de acceso", W / 2, 150);
+    canvas.setTextColor(RED);
+    canvas.drawString("APAGADO", W / 2, 195);
+    canvas.setFont(&fonts::FreeSansBold12pt7b); canvas.setTextColor(BLACK);
+    canvas.drawString("Red: " + g_apSsid, W / 2, 290);
+    canvas.setTextColor(BLUE);
+    canvas.drawString("Pulsa ARRIBA para encenderlo", W / 2, 360);
+    canvas.setFont(&fonts::FreeSans9pt7b); canvas.setTextColor(BLACK); canvas.setTextDatum(bottom_center);
+    canvas.drawString("G1: salir del modo WiFi", W / 2, H - 8);
+    canvas.pushSprite(0, 0);
+    return;
+  }
+
+  // -------- AP ENCENDIDO: datos + QR --------
+  String ip = WiFi.softAPIP().toString();
+  canvas.setTextDatum(top_center);
+  canvas.setFont(&fonts::FreeSansBold18pt7b); canvas.setTextColor(BLACK);
+  canvas.drawString("Red WiFi activa", W / 2, 54);
+  canvas.setFont(&fonts::FreeSansBold12pt7b); canvas.setTextColor(BLACK);
+  canvas.drawString("Red: " + g_apSsid, W / 2, 92);
+  canvas.drawString("Clave: " + g_apPass, W / 2, 116);
+  canvas.setTextColor(RED);
+  canvas.drawString("http://" + ip, W / 2, 142);
+  canvas.setTextColor(BLACK);
+  canvas.drawString("web: " + g_webUser + " / " + g_webPass, W / 2, 168);
+
+  // QR para unirse directamente a la red WiFi (formato estandar WIFI:...)
+  String qr = "WIFI:T:WPA;S:" + wifiQrEsc(g_apSsid) + ";P:" + wifiQrEsc(g_apPass) + ";;";
+  int L = qr.length();
+  uint8_t ver = (L <= 40) ? 4 : (L <= 60) ? 5 : (L <= 84) ? 6 : 8;
+  int qw = 200, qx = (W - qw) / 2, qy = 198;
+  canvas.fillRect(qx - 8, qy - 8, qw + 16, qw + 16, WHITE);
+  canvas.qrcode(qr, qx, qy, qw, ver);
+  canvas.setFont(&fonts::FreeSans12pt7b); canvas.setTextColor(BLACK);
+  canvas.drawString("Escanea para conectar el movil", W / 2, qy + qw + 14);
+
+  canvas.setFont(&fonts::FreeSans9pt7b); canvas.setTextDatum(bottom_center);
+  canvas.drawString("ABAJO: apagar    G1: salir", W / 2, H - 8);
+  canvas.pushSprite(0, 0);
+}
+
 void drawCurrentMode() {
   auto dt = M5.Rtc.getDateTime();
   switch (g_mode) {
@@ -1318,6 +1594,7 @@ void drawCurrentMode() {
     case MODE_CARRUSEL: drawCarrusel(); break;
     case MODE_MUSICA:   drawMusic(); break;
     case MODE_LIBRO:    if (g_libState == LIB_LIST) drawLibroList(); else drawLibro(); break;
+    case MODE_WIFI:     drawWifi(); break;
     default: break;
   }
 }
@@ -1372,8 +1649,19 @@ void tvBGone() {
 }
 
 // ============================ CONTROL DE MODOS ============================
+// Siguiente modo ACTIVO a partir de 'from' (excluido). Si ninguno mas activo, devuelve 'from'.
+Mode nextEnabledMode(Mode from) {
+  for (int i = 1; i <= MODE_COUNT; i++) {
+    Mode m = (Mode)(((int)from + i) % MODE_COUNT);
+    if (g_modeEnabled[m]) return m;
+  }
+  return from;
+}
 void changeMode() {
-  g_mode = (Mode)((g_mode + 1) % MODE_COUNT);
+  Mode nm = nextEnabledMode(g_mode);
+  if (nm == g_mode) return;            // no hay otro modo activo: nada que hacer
+  if (g_mode == MODE_WIFI) stopWifiMode();   // saliendo del modo WiFi: apaga AP y servidor
+  g_mode = nm;
   prefs.putUChar("mode", (uint8_t)g_mode);
   Serial.printf("-> Modo %s\n", MODE_NAMES[g_mode]);
   if (g_mode == MODE_CARRUSEL) g_lastCarouselSec = rtcNow();
@@ -1381,6 +1669,7 @@ void changeMode() {
   if (g_mode == MODE_LIBRO) { g_libState = LIB_LIST; g_sel = g_bookIdx; }  // al entrar: selector
   if (g_mode == MODE_MUSICA) audioPowerOn();   // enciende codec/ampli solo en musica
   else                       audioPowerOff();  // al salir: para audio y apaga codec/ampli (ahorro)
+  // El modo WiFi entra APAGADO: el AP se activa a mano con ARRIBA (ver modeUp).
   applyEpdMode();
   g_needRedraw = true;
 }
@@ -1398,12 +1687,14 @@ void modeUp() {
   else if (g_mode == MODE_CARRUSEL && !g_images.empty()) {
     g_img_idx = (g_img_idx + 1) % g_images.size(); g_lastCarouselSec = rtcNow(); g_needRedraw = true;
   }
+  else if (g_mode == MODE_WIFI) { if (g_wifiModeOn) stopWifiMode(); g_needRedraw = true; }      // (boton fisico inferior) apagar AP
 }
 void modeDown() {
   if (g_mode == MODE_CLIMA) { g_view = (g_view + numViews() - 1) % numViews(); g_needRedraw = true; }
   else if (g_mode == MODE_CARRUSEL && !g_images.empty()) {
     g_img_idx = (g_img_idx + g_images.size() - 1) % g_images.size(); g_lastCarouselSec = rtcNow(); g_needRedraw = true;
   }
+  else if (g_mode == MODE_WIFI) { if (!g_wifiModeOn) startWifiMode(); g_needRedraw = true; }     // (boton fisico superior=ARRIBA) encender AP
 }
 
 // ============================ AHORRO DE BATERIA ============================
@@ -1430,9 +1721,11 @@ void enterDeepSleep() {
 }
 
 void lightSleepFor(uint32_t ms) {
-  gpio_wakeup_enable((gpio_num_t)PIN_BTN_MODE, GPIO_INTR_LOW_LEVEL);
-  gpio_wakeup_enable((gpio_num_t)PIN_BTN_UP,   GPIO_INTR_LOW_LEVEL);
-  gpio_wakeup_enable((gpio_num_t)PIN_BTN_DOWN, GPIO_INTR_LOW_LEVEL);
+  const gpio_num_t btns[] = {(gpio_num_t)PIN_BTN_MODE, (gpio_num_t)PIN_BTN_UP, (gpio_num_t)PIN_BTN_DOWN};
+  for (auto p : btns) {
+    gpio_sleep_sel_dis(p);                       // mantiene input+pullup durante el light sleep (wake fiable en S3)
+    gpio_wakeup_enable(p, GPIO_INTR_LOW_LEVEL);
+  }
   esp_sleep_enable_gpio_wakeup();
   esp_sleep_enable_timer_wakeup((uint64_t)ms * 1000ULL);
   esp_light_sleep_start();   // despierta por boton o temporizador; el loop continua
@@ -1443,8 +1736,8 @@ void lightSleepFor(uint32_t ms) {
 // Reposo: light sleep en inactividad (despierta con boton o el proximo refresco); deep sleep a la hora.
 void powerTick() {
   uint32_t now = millis();
-  // No dormir si hay refresco pendiente/ocupado o estamos en musica (audio activo)
-  if (g_needRedraw || g_busy || g_mode == MODE_MUSICA) { delay(5); return; }
+  // No dormir si hay refresco pendiente/ocupado, en musica (audio) o en WiFi (servidor activo)
+  if (g_needRedraw || g_busy || g_mode == MODE_MUSICA || g_mode == MODE_WIFI) { delay(5); return; }
   if (now - g_lastInput < IDLE_SLEEP_MS) { delay(10); return; }   // margen para doble-click/mantener
 
   // Todo medido con el RTC (segundos), inmune a que millis() no avance en el light sleep
@@ -1517,7 +1810,8 @@ void setup() {
   prefs.begin("papercolor", false);
   g_mode = (Mode)prefs.getUChar("mode", MODE_CLIMA);
   if (g_mode >= MODE_COUNT) g_mode = MODE_CLIMA;
-  applyEpdMode();
+  if (!g_modeEnabled[g_mode]) g_mode = nextEnabledMode(g_mode);   // el guardado puede estar desactivado
+  applyEpdMode();   // el modo WiFi arranca con el AP apagado (se activa a mano)
   // El selector de libros arranca en el ultimo leido (cada libro carga su pagina al abrirlo)
   int lastBook = prefs.getInt("lastbook", 0);
   if (!g_books.empty()) {
@@ -1611,12 +1905,13 @@ void loop() {
   // Arranque rapido: la pantalla local ya esta pintada; ahora baja WiFi+NTP+AEMET UNA vez,
   // en segundo plano. NO se repinta: el local se refresca solo en su ciclo (1/5 min, con la hora
   // ya sincronizada por NTP) y las tarjetas AEMET se ven al navegar a una ciudad.
-  if (g_bootFetchPending && !g_needRedraw && !g_busy) {
+  if (g_bootFetchPending && g_mode != MODE_WIFI && !g_needRedraw && !g_busy) {
     g_bootFetchPending = false;
     fetchAllOnline(true);
   }
 
-  // Ahorro de bateria: light sleep en reposo, deep sleep tras 1h. (En musica reproduciendo no duerme.)
-  if (g_mode == MODE_MUSICA && g_playing) { /* sin delay: audio fluido */ }
+  // Modo WiFi con AP encendido: atender el servidor web (no se duerme). Resto: ahorro.
+  if (g_mode == MODE_WIFI && g_wifiModeOn) { g_server.handleClient(); }
+  else if (g_mode == MODE_MUSICA && g_playing) { /* sin delay: audio fluido */ }
   else powerTick();
 }

@@ -27,6 +27,8 @@
 - 🎵 **Música** — reproductor desde la SD (**MP3 / M4A / FLAC / WAV / AAC**) con el códec ES8311.
   Títulos con acentos correctos (fuente propia).
 - 📖 **Libro** — lector de **TXT** desde `/Libros` con selector de archivos y memoria de página por libro (EPUB próximamente).
+- 📶 **WiFi** — punto de acceso propio (se activa a mano) con **QR de conexión** y **gestor web de la microSD** (navegar, descargar, subir, editar, borrar, **galería** y **vídeo ligero** con streaming Range). Con login, sin router.
+- ⚙️ **Modos configurables** — activa/desactiva cualquier modo desde `config.json`; los desactivados se saltan.
 - 📺 **TV-B-Gone (modo oculto)** — apaga televisores por IR (108 códigos europeos).
 - 🕒 Hora por **NTP** mantenida en el **RTC**, con horario de verano automático.
 
@@ -38,7 +40,7 @@ Tres botones de usuario (el cuarto es el de encendido):
 
 | Botón | Gesto | Acción |
 |-------|-------|--------|
-| **G1** (GPIO1) | 1 click | **Cambiar de modo** (Clima → Carrusel → Música → Libro) |
+| **G1** (GPIO1) | 1 click | **Cambiar de modo** (Clima → Carrusel → Música → Libro → WiFi; salta los desactivados) |
 | **G1** | Doble click | 📺 **TV-B-Gone** (modo oculto: apaga la TV) |
 | **G1** | Mantener (~0,8 s) | Acción del modo · *Clima:* actualizar por WiFi (NTP + AEMET) |
 | **UP** (GPIO9) / **DOWN** (GPIO10) | — | Navegación del modo (ver abajo) |
@@ -52,6 +54,7 @@ Tres botones de usuario (el cuarto es el de encendido):
 | Música | **Volumen** −/+ | **Canción** ant/sig | **Play / Pausa** |
 | Libro *(lista)* | Mover selección | **Abrir** libro | — |
 | Libro *(leyendo)* | Página ant/sig | — | **Volver a la lista** (mantener G1) |
+| WiFi | **Encender / apagar** el AP | — | — (gestión desde el navegador) |
 
 El modo activo se guarda en NVS y se restaura al reiniciar. En **Libro**, cada archivo recuerda su última página.
 
@@ -85,6 +88,8 @@ Formatea en **FAT32** y crea esta estructura en la raíz:
   "carousel_seconds": 300,
   "photo_auto_rotate": true,
   "deep_sleep_minutes": 60,
+  "modos": { "clima": true, "carrusel": true, "musica": true, "libro": true, "wifi": true },
+  "wifi_modo": { "ap_ssid": "PaperColor", "ap_pass": "papercolor1234", "user": "admin", "pass": "admin" },
 
   "fotos_dir": "/Fotos",
   "musica_dir": "/Musica",
@@ -108,6 +113,8 @@ Formatea en **FAT32** y crea esta estructura en la raíz:
 | `carousel_seconds` | Segundos entre fotos. |
 | `photo_auto_rotate` | `true` = gira el panel según la orientación de cada foto. |
 | `deep_sleep_minutes` | Minutos de inactividad antes de **apagarse** (deep sleep por PMIC). Se enciende con el botón de encendido. |
+| `modos` | Activa/desactiva cada modo (`clima`/`carrusel`/`musica`/`libro`/`wifi`). Un modo en `false` **no se ejecuta** y G1 lo **salta**. Si los pones todos en `false`, se reactivan todos (a prueba de bloqueos). |
+| `wifi_modo` | Modo WiFi (gestor de la SD): `ap_ssid`/`ap_pass` del punto de acceso propio (**`ap_pass` mín. 8 caracteres**) y `user`/`pass` del login web. |
 | `fotos_dir`/`musica_dir`/`libros_dir` | Carpetas en la SD. |
 | `font_title` | Fuente VLW (con acentos) para los títulos. |
 | `font_body` | Fuente VLW (con acentos) para el lector de libros. |
@@ -207,6 +214,35 @@ encenderlo, pulsa el **botón de ENCENDIDO** (arranca de cero). Mientras se repr
 
 ---
 
+## 📶 Modo WiFi (gestor de la microSD)
+
+El modo entra **apagado**. Pulsa **ARRIBA** para **activar** el punto de acceso (estilo *nomad*, sin
+router) y el **servidor web**; **ABAJO** lo apaga. Con el AP activo, la pantalla muestra **SSID**,
+**contraseña**, **IP** (http://192.168.4.1), **usuario/clave** del login y un **código QR** para que el
+móvil se **una a la red directamente** (apunta la cámara al QR).
+
+1. En el modo WiFi, pulsa **ARRIBA** para encender el AP.
+2. Conéctate a la red (escaneando el **QR** o a mano con SSID/clave en pantalla).
+3. Abre `http://192.168.4.1`, introduce usuario/clave y **navega, descarga, sube, edita (texto) o borra**.
+
+Además incluye **Galería** (rejilla de imágenes con *lazy-load*) y **visor inline**: pulsa *ver* en una
+imagen o vídeo para verlo en el navegador. El servidor soporta **peticiones Range (HTTP 206)**, así que
+el `<video>` reproduce y permite avanzar (necesario en iOS) y las descargas grandes se pueden reanudar.
+
+El botón **Config** abre un editor de `config.json` (valida el JSON al guardar; reinicia para aplicar).
+Todo el gestor —incluida la edición de configuración— está **detrás del login**, así que las credenciales
+del `config.json` (WiFi, clave AEMET) no quedan expuestas a quien solo conozca la clave del AP.
+
+> 🎬 **Vídeo:** el decodifica el navegador del móvil; el equipo solo sirve los bytes. Como la microSD va
+> por **SPI** (no SDIO), el caudal es limitado: va bien con **clips ligeros** (MP4 H.264/AAC, ~480p), no con HD.
+
+Con el AP encendido no entra en reposo. **ABAJO** apaga el AP; **G1** sale del modo.
+Todo se configura en `wifi_modo` del `config.json` (la contraseña del AP debe tener **≥ 8 caracteres**).
+
+> 🔒 El acceso está protegido por la contraseña del AP **y** por el login web; cámbialos en `config.json`.
+
+---
+
 ## 🧩 Hardware (verificado contra el esquemático C151 V0.5)
 
 | Componente | Detalle |
@@ -297,8 +333,10 @@ pio device monitor  # monitor serie
 - [x] Refresco LOCAL con cadencia inteligente (1 min; 5 min en reposo)
 - [x] Arranque rápido (pantalla local inmediata; WiFi/NTP/AEMET en segundo plano)
 - [x] Bajo consumo: *light sleep* en reposo + apagado por PMIC tras inactividad
-- [x] HOY ampliado: sensación térmica, viento + racha, índice UV
+- [x] HOY ampliado: viento + racha, índice UV, previsión por horas
 - [x] Lector: alto de línea automático según el tamaño de `body.vlw`
+- [x] Modos activables/desactivables desde `config.json`
+- [x] Modo WiFi: AP propio + gestor web de la microSD (con login)
 - [ ] Modo libro **EPUB** (descompresión ZIP + extracción de texto)
 - [ ] Alarma RTC para encender a una hora programada
 
