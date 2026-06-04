@@ -49,7 +49,6 @@
 #include <vector>
 #include "esp_sleep.h"
 #include "driver/gpio.h"
-#include "driver/rtc_io.h"
 #include "Audio.h"        // ESP32-audioI2S (schreibfaul1) v3.4.6
 #include <IRremoteESP8266.h>
 #include <IRsend.h>
@@ -111,14 +110,10 @@ float g_temp = NAN, g_hum = NAN;
 bool  sht_ready = false, sd_ready = false;
 // Refresco inteligente de la vista LOCAL
 uint32_t g_lastInput = 0;          // ultimo toque de boton (para el ahorro a los 5 min)
-uint32_t g_lastLocalUpdate = 0;
-int      g_lastMin = -1, g_lastDay = -1;
-int      g_localPartials = 0;      // nº de refrescos parciales desde el ultimo completo
 
 // Carrusel
 std::vector<String> g_images;
 size_t g_img_idx = 0;
-uint32_t last_carousel_ms = 0;
 int g_rot = -1;   // rotacion actual del panel (1=apaisado, 0=vertical)
 
 // Musica (estilo iPod Shuffle)
@@ -666,24 +661,6 @@ void drawWeatherIcon(int cx, int cy, int s, const char* desc) {
   if (snow)  for (int i = -1; i <= 1; i++) { int x = cx + i * (s / 2); canvas.drawLine(x - 3, py, x + 3, py, BLUE); canvas.drawLine(x, py - 3, x, py + 3, BLUE); }
 }
 
-// Texto con salto de linea por palabras. Devuelve la Y tras la ultima linea.
-int drawWrapped(const char* text, int x, int y, int maxW, int lineH) {
-  canvas.setTextDatum(top_left);
-  String s = text ? text : "", line = "", word = "";
-  int yy = y;
-  for (int i = 0; i <= (int)s.length(); i++) {
-    char c = (i < (int)s.length()) ? s[i] : ' ';
-    if (c == ' ') {
-      String test = line.length() ? line + " " + word : word;
-      if (canvas.textWidth(test) > maxW && line.length()) { canvas.drawString(line, x, yy); yy += lineH; line = word; }
-      else line = test;
-      word = "";
-    } else word += c;
-  }
-  if (line.length()) { canvas.drawString(line, x, yy); yy += lineH; }
-  return yy;
-}
-
 // Color del indice UV segun la paleta del panel (Spectra 6): bajo=verde, moderado=amarillo, alto=rojo.
 uint16_t uvColor(int uv) { return (uv <= 2) ? GREEN : (uv <= 5) ? YELLOW : RED; }
 
@@ -842,8 +819,7 @@ void drawWeatherLocal(const m5::rtc_datetime_t& dt) {
   locHum(canvas);
   canvas.drawString("Humedad", W / 2, 565);
   canvas.pushSprite(0, 0);
-  g_lastMin = dt.time.minutes; g_lastDay = dt.date.date;
-  g_localPartials = 0; g_lastLocalUpdate = millis(); g_lastLocalUpdateSec = rtcNow();
+  g_lastLocalUpdateSec = rtcNow();
 }
 
 void drawWeatherCity(const m5::rtc_datetime_t& dt, int loc) {
@@ -997,13 +973,6 @@ void drawCarrusel() {
   const int W = M5.Display.width(), H = M5.Display.height();
   canvas.fillSprite(WHITE);
   drawImageFitted(path, 0, 0, W, H);
-  canvas.pushSprite(0, 0);
-}
-void drawConstruccion(const char* titulo, const char* sub) {
-  const int H = M5.Display.height();
-  canvas.fillSprite(WHITE);
-  drawCenteredMsg(titulo, H / 2 - 30, BLACK, &fonts::FreeSansBold24pt7b);
-  drawCenteredMsg(sub, H / 2 + 20, BLACK, &fonts::FreeSansBold18pt7b);
   canvas.pushSprite(0, 0);
 }
 
@@ -1407,7 +1376,7 @@ void changeMode() {
   g_mode = (Mode)((g_mode + 1) % MODE_COUNT);
   prefs.putUChar("mode", (uint8_t)g_mode);
   Serial.printf("-> Modo %s\n", MODE_NAMES[g_mode]);
-  if (g_mode == MODE_CARRUSEL) { last_carousel_ms = millis(); g_lastCarouselSec = rtcNow(); }
+  if (g_mode == MODE_CARRUSEL) g_lastCarouselSec = rtcNow();
   else setPanelRotation(0);          // el resto de modos en vertical
   if (g_mode == MODE_LIBRO) { g_libState = LIB_LIST; g_sel = g_bookIdx; }  // al entrar: selector
   if (g_mode == MODE_MUSICA) audioPowerOn();   // enciende codec/ampli solo en musica
@@ -1427,13 +1396,13 @@ void modeLongPress() {
 void modeUp() {
   if (g_mode == MODE_CLIMA) { g_view = (g_view + 1) % numViews(); g_needRedraw = true; }
   else if (g_mode == MODE_CARRUSEL && !g_images.empty()) {
-    g_img_idx = (g_img_idx + 1) % g_images.size(); last_carousel_ms = millis(); g_lastCarouselSec = rtcNow(); g_needRedraw = true;
+    g_img_idx = (g_img_idx + 1) % g_images.size(); g_lastCarouselSec = rtcNow(); g_needRedraw = true;
   }
 }
 void modeDown() {
   if (g_mode == MODE_CLIMA) { g_view = (g_view + numViews() - 1) % numViews(); g_needRedraw = true; }
   else if (g_mode == MODE_CARRUSEL && !g_images.empty()) {
-    g_img_idx = (g_img_idx + g_images.size() - 1) % g_images.size(); last_carousel_ms = millis(); g_lastCarouselSec = rtcNow(); g_needRedraw = true;
+    g_img_idx = (g_img_idx + g_images.size() - 1) % g_images.size(); g_lastCarouselSec = rtcNow(); g_needRedraw = true;
   }
 }
 
@@ -1558,9 +1527,7 @@ void setup() {
   g_libState = LIB_LIST;
   Serial.printf("Modo inicial: %s\n", MODE_NAMES[g_mode]);
 
-  last_carousel_ms = millis();
   g_lastInput = millis();
-  g_lastLocalUpdate = millis();
   g_lastActiveSec = rtcNow();              // baseline de inactividad (RTC)
   g_lastLocalUpdateSec = rtcNow();
   g_lastCarouselSec = rtcNow();

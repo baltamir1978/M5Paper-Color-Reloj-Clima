@@ -300,7 +300,6 @@ pio device monitor  # monitor serie
 - [x] HOY ampliado: sensación térmica, viento + racha, índice UV
 - [x] Lector: alto de línea automático según el tamaño de `body.vlw`
 - [ ] Modo libro **EPUB** (descompresión ZIP + extracción de texto)
-- [ ] *Core 0* para refrescar sin bloquear botones durante los ~12 s de refresco
 - [ ] Alarma RTC para encender a una hora programada
 
 > ℹ️ **Sobre los refrescos:** el e-paper a color (Spectra 6) solo hace **refrescos completos**
