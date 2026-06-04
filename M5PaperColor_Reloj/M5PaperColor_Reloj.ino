@@ -2,23 +2,31 @@
  * ============================================================================
  *  M5Paper Color (ESP32-S3) - Estacion multimodo
  * ============================================================================
- *  4 modos (boton G1 doble-click):
+ *  4 modos (boton G1, 1 click para rotar):
  *    1 CLIMA   : vistas Up/Down -> LOCAL (fecha/hora + sensor) + ciudades AEMET
  *    2 CARRUSEL: fotos de la microSD a pantalla completa
- *    3 MUSICA  : (en construccion) MP3 de la SD
- *    4 LIBRO   : (en construccion) TXT/EPUB
+ *    3 MUSICA  : reproductor MP3/M4A de la SD (controles tipo iPod Shuffle)
+ *    4 LIBRO   : lector de TXT (lista de /Libros, recuerda la pagina de cada uno)
+ *  Modo oculto: G1 doble-click = TV-B-Gone (IR), feedback con el LED RGB.
  *
  *  TODA la configuracion va en /config.json de la microSD (ver ejemplo en el
  *  repo). Si falta la SD o el archivo, se usan los valores por defecto de abajo.
  *
  *  BOTONES (GPIO, activos a nivel bajo):
- *    G1=GPIO1 (top): doble-click=modo | mantener=accion (CLIMA: actualizar WiFi)
- *    UP=GPIO9 / DOWN=GPIO10: navegacion del modo
+ *    G1=GPIO1 (top): 1 click=cambia de modo | doble-click=TV-B-Gone |
+ *                    mantener=accion del modo (CLIMA: actualizar AEMET por WiFi)
+ *    UP=GPIO9 / DOWN=GPIO10: navegacion del modo (volumen/pista en musica, pagina en libro)
+ *
+ *  ARRANQUE RAPIDO: se pinta la pantalla local enseguida (hora del RTC + sensor) y
+ *    la descarga WiFi/NTP/AEMET se hace en segundo plano (no bloquea ni muestra "Sin WiFi").
+ *  AHORRO: light sleep en reposo; tras 'deep_sleep_minutes' de inactividad se APAGA por
+ *    PMIC (M5.Power.powerOff) -> se enciende pulsando el boton de ENCENDIDO. El e-paper
+ *    conserva la ultima imagen aunque este apagado. (En musica reproduciendo no duerme.)
  *
  *  HARDWARE: SHT40 0x44 / RTC RX8130CE 0x32 / PMIC M5PM1 0x6E (I2C SDA=3 SCL=2)
  *    SPI e-paper+SD: MOSI=13 MISO=14 SCK=15; EINK_DC=43 CS=44; SD_CS=47
  *    SD/e-paper en rail L3B del PMIC -> habilitar LDO antes de SD.begin
- *  Librerias: M5Unified, M5GFX, M5UnitENV, M5PM1, ArduinoJson
+ *  Librerias: M5Unified, M5GFX, M5UnitENV, M5PM1, ArduinoJson, ESP32-audioI2S, IRremoteESP8266
  *  Arduino IDE: "ESP32S3 Dev Module", Flash 16MB, PSRAM "OPI PSRAM", USB CDC On.
  * ============================================================================
  */
@@ -39,6 +47,9 @@
 #include <Preferences.h>
 #include <time.h>
 #include <vector>
+#include "esp_sleep.h"
+#include "driver/gpio.h"
+#include "driver/rtc_io.h"
 #include "Audio.h"        // ESP32-audioI2S (schreibfaul1) v3.4.6
 #include <IRremoteESP8266.h>
 #include <IRsend.h>
@@ -54,7 +65,6 @@ struct WifiCred; struct Location; struct ClimaDay; struct ClimaCache;
 #define NTP_SERVER1 "0.pool.ntp.org"
 #define NTP_SERVER2 "1.pool.ntp.org"
 
-static constexpr uint32_t SHT_UPDATE_MS    = 120000;   // sensor cada 2 min
 static constexpr uint32_t WIFI_PER_NET_MS  = 8000;     // espera por cada red
 static constexpr uint32_t SNTP_TIMEOUT_MS  = 20000;
 
@@ -99,8 +109,7 @@ Mode  g_mode = MODE_CLIMA;
 bool  g_needRedraw = true, g_busy = false;
 float g_temp = NAN, g_hum = NAN;
 bool  sht_ready = false, sd_ready = false;
-uint32_t last_sht_ms = 0;
-// Refresco inteligente de la vista LOCAL (parcial)
+// Refresco inteligente de la vista LOCAL
 uint32_t g_lastInput = 0;          // ultimo toque de boton (para el ahorro a los 5 min)
 uint32_t g_lastLocalUpdate = 0;
 int      g_lastMin = -1, g_lastDay = -1;
@@ -120,6 +129,15 @@ int    g_volume = 12;        // 0..21
 bool   g_playing = false;
 bool   g_loaded = false;     // hay una pista cargada
 bool   g_audioReady = false; // ES8311 + I2S inicializados
+bool   g_audioPowered = false; // codec/ampli encendidos (solo en musica, ahorro)
+// Ahorro de bateria
+static constexpr uint32_t IDLE_SLEEP_MS = 4000;       // margen tras el ultimo boton antes de dormir
+uint32_t g_deepSleepMs = 3600000UL;                   // inactividad -> deep sleep (config deep_sleep_minutes)
+uint32_t g_ignoreInputUntil = 0;                      // ignora botones justo tras arrancar/despertar
+bool     g_bootFetchPending = true;                   // arranque: baja WiFi/NTP/AEMET tras pintar local
+time_t   g_lastActiveSec = 0;                         // momento (RTC, segundos) del ultimo boton real
+time_t   g_lastLocalUpdateSec = 0;                    // ultimo refresco del reloj local (RTC)
+time_t   g_lastCarouselSec = 0;                       // ultimo avance del carrusel (RTC)
 volatile bool g_trackEnded = false;   // lo pone el callback de la libreria al acabar la pista
 uint8_t* g_titleFont = nullptr;       // buffer del .vlw en memoria (acentos)
 bool     g_titleFontReady = false;
@@ -169,6 +187,7 @@ void loadDefaults() {
   g_titleFontPath = "/fonts/title.vlw";
   g_bodyFontPath  = "/fonts/body.vlw";
   g_photoAutoRotate = true;
+  g_deepSleepMs = 3600000UL;   // 60 min
   g_locs.clear();
   g_locs.push_back({"Madrid",           "28079", "3126Y"});  // obs El Goloso
   g_locs.push_back({"San Ildefonso",    "40181", ""});
@@ -200,6 +219,7 @@ bool loadConfig() {
   if (doc["font_title"].is<const char*>()) g_titleFontPath = (const char*)doc["font_title"];
   if (doc["font_body"].is<const char*>())  g_bodyFontPath  = (const char*)doc["font_body"];
   if (doc["photo_auto_rotate"].is<bool>()) g_photoAutoRotate = doc["photo_auto_rotate"];
+  if (doc["deep_sleep_minutes"].is<int>()) g_deepSleepMs = (uint32_t)doc["deep_sleep_minutes"] * 60000UL;
   // Ubicaciones
   g_locs.clear();
   for (JsonObject l : doc["locations"].as<JsonArray>()) {
@@ -357,7 +377,6 @@ void showBusy(const char* msg) {
   drawCenteredMsg(msg, M5.Display.height() / 2);
   canvas.pushSprite(0, 0);
 }
-void showHelperBusyFail() { showBusy("Sin WiFi"); delay(1200); }
 
 // ============================ AEMET ============================
 bool aemetFetch(int idx) {
@@ -469,8 +488,9 @@ bool aemetFetchObs(int idx) {
 }
 
 // Descarga (NTP + prediccion + observacion) de todas las ubicaciones.
+// Sin aviso si no hay WiFi: el clima ya delata el fallo (sin datos / hora de actualizacion vieja).
 void fetchAllOnline(bool withNtp) {
-  if (!connectWiFi()) { showHelperBusyFail(); return; }
+  if (!connectWiFi()) return;
   if (withNtp) syncRtcFromSntp();
   if (g_apiKey.length() > 0) {
     for (int i = 0; i < numLocs(); i++) {   // sin refrescos por ciudad (el e-paper es lento)
@@ -663,7 +683,7 @@ void drawWeatherLocal(const m5::rtc_datetime_t& dt) {
   canvas.drawString("Humedad", W / 2, 565);
   canvas.pushSprite(0, 0);
   g_lastMin = dt.time.minutes; g_lastDay = dt.date.date;
-  g_localPartials = 0; g_lastLocalUpdate = millis();
+  g_localPartials = 0; g_lastLocalUpdate = millis(); g_lastLocalUpdateSec = rtcNow();
 }
 
 void drawWeatherCity(const m5::rtc_datetime_t& dt, int loc) {
@@ -881,28 +901,43 @@ String utf8Fix(const String& in) {
 }
 
 // Inicializa el codec ES8311 (secuencia M5Unified PaperColor, MCLK=BCLK) y el I2S.
+// Init I2S + callback (UNA vez). El codec/ampli arrancan APAGADOS (ahorro): solo se encienden en musica.
 void audioInit() {
-  pinMode(PIN_CODEC_EN, OUTPUT); digitalWrite(PIN_CODEC_EN, HIGH);   // habilita codec
-  pinMode(PIN_SPK_EN, OUTPUT);   digitalWrite(PIN_SPK_EN, HIGH);     // habilita amplificador
+  pinMode(PIN_CODEC_EN, OUTPUT); digitalWrite(PIN_CODEC_EN, LOW);
+  pinMode(PIN_SPK_EN, OUTPUT);   digitalWrite(PIN_SPK_EN, LOW);
+  audio.setPinout(I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN);   // MCLK no necesario (=BCLK)
+  audio.setAudioTaskCore(0);     // tarea de audio en el core 0 (Arduino corre en el 1)
+  // Fin de pista fiable via callback de la libreria (evt_eof)
+  Audio::audio_info_callback = [](Audio::msg_t m) { if (m.e == Audio::evt_eof) g_trackEnded = true; };
+  g_audioReady = true;
+  Serial.println("Audio (I2S) listo; codec apagado hasta reproducir.");
+}
+// Enciende codec ES8311 + ampli e inicializa registros (al entrar en musica).
+void audioPowerOn() {
+  if (g_audioPowered) return;
+  digitalWrite(PIN_CODEC_EN, HIGH); digitalWrite(PIN_SPK_EN, HIGH);
   delay(10);
   static const uint8_t seq[][2] = {
     {0x00, 0x80}, {0x01, 0xB5}, {0x02, 0x18}, {0x0D, 0x01},
     {0x12, 0x00}, {0x13, 0x10}, {0x32, 0xCF}, {0x37, 0x08}
   };
   for (auto& r : seq) M5.In_I2C.writeRegister8(ES8311_ADDR, r[0], r[1], 100000);
-
-  audio.setPinout(I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN);   // MCLK no necesario (=BCLK)
-  audio.setAudioTaskCore(0);     // tarea de audio en el core 0 (Arduino corre en el 1)
   audio.setVolume(g_volume);
-  // Fin de pista fiable via callback de la libreria (evt_eof)
-  Audio::audio_info_callback = [](Audio::msg_t m) { if (m.e == Audio::evt_eof) g_trackEnded = true; };
-  g_audioReady = true;
-  Serial.println("Audio ES8311 inicializado.");
+  g_audioPowered = true;
+  Serial.println("Codec ES8311 encendido.");
+}
+// Para la reproduccion y apaga codec + ampli (al salir de musica / ahorro).
+void audioPowerOff() {
+  if (g_audioReady && audio.isRunning()) audio.stopSong();
+  g_playing = false; g_loaded = false;
+  digitalWrite(PIN_CODEC_EN, LOW); digitalWrite(PIN_SPK_EN, LOW);
+  g_audioPowered = false;
 }
 
 // --- Acciones de audio (estilo iPod Shuffle) ---
 void musicPlayCurrent() {
   if (g_music.empty() || !g_audioReady) return;
+  audioPowerOn();   // asegura codec/ampli encendidos
   Serial.printf("[MUSICA] play %s (vol %d)\n", trackName(g_music[g_track]).c_str(), g_volume);
   audio.connecttoFS(SD, g_music[g_track].c_str());
   audio.setVolume(g_volume);
@@ -1207,9 +1242,11 @@ void changeMode() {
   g_mode = (Mode)((g_mode + 1) % MODE_COUNT);
   prefs.putUChar("mode", (uint8_t)g_mode);
   Serial.printf("-> Modo %s\n", MODE_NAMES[g_mode]);
-  if (g_mode == MODE_CARRUSEL) last_carousel_ms = millis();
+  if (g_mode == MODE_CARRUSEL) { last_carousel_ms = millis(); g_lastCarouselSec = rtcNow(); }
   else setPanelRotation(0);          // el resto de modos en vertical
   if (g_mode == MODE_LIBRO) { g_libState = LIB_LIST; g_sel = g_bookIdx; }  // al entrar: selector
+  if (g_mode == MODE_MUSICA) audioPowerOn();   // enciende codec/ampli solo en musica
+  else                       audioPowerOff();  // al salir: para audio y apaga codec/ampli (ahorro)
   applyEpdMode();
   g_needRedraw = true;
 }
@@ -1225,14 +1262,72 @@ void modeLongPress() {
 void modeUp() {
   if (g_mode == MODE_CLIMA) { g_view = (g_view + 1) % numViews(); g_needRedraw = true; }
   else if (g_mode == MODE_CARRUSEL && !g_images.empty()) {
-    g_img_idx = (g_img_idx + 1) % g_images.size(); last_carousel_ms = millis(); g_needRedraw = true;
+    g_img_idx = (g_img_idx + 1) % g_images.size(); last_carousel_ms = millis(); g_lastCarouselSec = rtcNow(); g_needRedraw = true;
   }
 }
 void modeDown() {
   if (g_mode == MODE_CLIMA) { g_view = (g_view + numViews() - 1) % numViews(); g_needRedraw = true; }
   else if (g_mode == MODE_CARRUSEL && !g_images.empty()) {
-    g_img_idx = (g_img_idx + g_images.size() - 1) % g_images.size(); last_carousel_ms = millis(); g_needRedraw = true;
+    g_img_idx = (g_img_idx + g_images.size() - 1) % g_images.size(); last_carousel_ms = millis(); g_lastCarouselSec = rtcNow(); g_needRedraw = true;
   }
+}
+
+// ============================ AHORRO DE BATERIA ============================
+// Tiempo actual del RTC en segundos (inmune al sleep, a diferencia de millis()).
+time_t rtcNow() {
+  auto dt = M5.Rtc.getDateTime();
+  struct tm t = {};
+  t.tm_year = dt.date.year - 1900; t.tm_mon = dt.date.month - 1; t.tm_mday = dt.date.date;
+  t.tm_hour = dt.time.hours; t.tm_min = dt.time.minutes; t.tm_sec = dt.time.seconds;
+  return mktime(&t);
+}
+
+void enterDeepSleep() {
+  // Apagado gestionado por el PMIC (M5PM1). Consumo minimo y NO despierta solo:
+  // los botones G1/UP/DOWN son GPIO del ESP y su rail de pull-ups se apaga al dormir,
+  // asi que el unico despertar fiable es el boton de ENCENDIDO (cuelga del PMIC).
+  // El e-paper conserva la ultima imagen en pantalla aunque este apagado.
+  Serial.println("Deep sleep por inactividad (apagado PMIC). Pulsa ENCENDIDO para despertar.");
+  Serial.flush();
+  audioPowerOff();
+  WiFi.mode(WIFI_OFF);
+  delay(50);
+  M5.Power.powerOff();      // no retorna: el PMIC corta la alimentacion
+}
+
+void lightSleepFor(uint32_t ms) {
+  gpio_wakeup_enable((gpio_num_t)PIN_BTN_MODE, GPIO_INTR_LOW_LEVEL);
+  gpio_wakeup_enable((gpio_num_t)PIN_BTN_UP,   GPIO_INTR_LOW_LEVEL);
+  gpio_wakeup_enable((gpio_num_t)PIN_BTN_DOWN, GPIO_INTR_LOW_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+  esp_sleep_enable_timer_wakeup((uint64_t)ms * 1000ULL);
+  esp_light_sleep_start();   // despierta por boton o temporizador; el loop continua
+  // Si desperto por TEMPORIZADOR (no boton), ignora glitches de pin ~250 ms
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) g_ignoreInputUntil = millis() + 250;
+}
+
+// Reposo: light sleep en inactividad (despierta con boton o el proximo refresco); deep sleep a la hora.
+void powerTick() {
+  uint32_t now = millis();
+  // No dormir si hay refresco pendiente/ocupado o estamos en musica (audio activo)
+  if (g_needRedraw || g_busy || g_mode == MODE_MUSICA) { delay(5); return; }
+  if (now - g_lastInput < IDLE_SLEEP_MS) { delay(10); return; }   // margen para doble-click/mantener
+
+  // Todo medido con el RTC (segundos), inmune a que millis() no avance en el light sleep
+  time_t nowSec = rtcNow();
+  long idleSec = (long)(nowSec - g_lastActiveSec);
+  if (idleSec >= (long)(g_deepSleepMs / 1000)) { enterDeepSleep(); }   // no retorna
+
+  long wakeSec = 600;   // tope 10 min
+  if (g_mode == MODE_CLIMA && g_view == 0) {          // proximo refresco del reloj local
+    long intervalSec = (idleSec >= 300) ? 300 : 60;
+    long dueIn = intervalSec - (long)(nowSec - g_lastLocalUpdateSec);
+    if (dueIn < 1) dueIn = 1; if (dueIn < wakeSec) wakeSec = dueIn;
+  } else if (g_mode == MODE_CARRUSEL && sd_ready && !g_images.empty()) {  // proxima foto
+    long dueIn = (long)(g_carouselMs / 1000) - (long)(nowSec - g_lastCarouselSec);
+    if (dueIn < 1) dueIn = 1; if (dueIn < wakeSec) wakeSec = dueIn;
+  }
+  lightSleepFor((uint32_t)wakeSec * 1000UL);
 }
 
 // ============================ SETUP ============================
@@ -1280,8 +1375,9 @@ void setup() {
   audioInit();                           // codec ES8311 + I2S
   irsend.begin();                        // emisor IR (modo oculto TV-B-Gone)
 
-  // Arranque online: NTP + prediccion + observacion (se ve "Iniciando..." mientras tanto)
-  fetchAllOnline(true);
+  // Arranque rapido: NO se bloquea con el WiFi. Se pinta primero la pantalla local
+  // (hora del RTC + sensor, instantaneo) y la descarga WiFi/NTP/AEMET se hace en segundo
+  // plano tras el primer pintado (g_bootFetchPending, gestionado en loop()).
   g_busy = false;
 
   prefs.begin("papercolor", false);
@@ -1297,10 +1393,13 @@ void setup() {
   g_libState = LIB_LIST;
   Serial.printf("Modo inicial: %s\n", MODE_NAMES[g_mode]);
 
-  last_sht_ms = millis();
   last_carousel_ms = millis();
   g_lastInput = millis();
   g_lastLocalUpdate = millis();
+  g_lastActiveSec = rtcNow();              // baseline de inactividad (RTC)
+  g_lastLocalUpdateSec = rtcNow();
+  g_lastCarouselSec = rtcNow();
+  g_ignoreInputUntil = millis() + 1000;   // ignora el boton que nos despierta (~1s)
   g_needRedraw = true;
 }
 
@@ -1314,6 +1413,7 @@ void loop() {
   btnUp.setRawState(ms,   digitalRead(PIN_BTN_UP)   == LOW);
   btnDown.setRawState(ms, digitalRead(PIN_BTN_DOWN) == LOW);
 
+  if (ms >= g_ignoreInputUntil) {   // ignora la pulsacion que nos despierta / arranque
   if (btnMode.wasDoubleClicked())      tvBGone();        // doble-click: apaga la TV (IR)
   else if (btnMode.wasHold())          modeLongPress();  // mantener: accion del modo
   else if (btnMode.wasSingleClicked()) changeMode();     // 1 click (confirmado): cambia de modo
@@ -1342,23 +1442,31 @@ void loop() {
     if (btnUp.wasPressed())   modeUp();      // resto de modos: respuesta inmediata
     if (btnDown.wasPressed()) modeDown();
   }
-  // Cualquier toque de boton reinicia el contador de inactividad (para el ahorro)
-  if (btnMode.isPressed() || btnUp.isPressed() || btnDown.isPressed()) g_lastInput = ms;
+  }  // fin guardia de pulsaciones iniciales
+  // Solo una PULSACION REAL reinicia la inactividad, y no en la ventana de guarda tras despertar
+  // (asi un glitch del pin al salir del light sleep no resetea el contador del deep sleep).
+  if (ms >= g_ignoreInputUntil &&
+      (btnMode.wasPressed() || btnUp.wasPressed() || btnDown.wasPressed())) {
+    g_lastInput = ms; g_lastActiveSec = rtcNow();
+  }
+
+  // Temporizadores por RTC (millis() no avanza de forma fiable durante el light sleep)
+  time_t nowSec = ((g_mode == MODE_CLIMA && g_view == 0) || g_mode == MODE_CARRUSEL) ? rtcNow() : 0;
 
   // Vista LOCAL: 1 refresco COMPLETO cada minuto; tras 5 min sin tocar boton, cada 5 min (ahorro).
-  // (El e-paper a color no hace parcial real: cada display() es un refresco completo del panel.)
   if (g_mode == MODE_CLIMA && g_view == 0 && !g_busy && !g_needRedraw) {
-    uint32_t interval = (ms - g_lastInput >= 300000UL) ? 300000UL : 60000UL;
-    if (ms - g_lastLocalUpdate >= interval) {
+    long idleSec = (long)(nowSec - g_lastActiveSec);
+    long intervalSec = (idleSec >= 300) ? 300 : 60;
+    if ((long)(nowSec - g_lastLocalUpdateSec) >= intervalSec) {
       readSHT40();
-      g_lastLocalUpdate = ms;
-      g_needRedraw = true;     // un unico refresco completo
+      g_needRedraw = true;     // drawWeatherLocal actualiza g_lastLocalUpdateSec
     }
   }
 
-  // Carrusel automatico (infinito: g_img_idx siempre con modulo)
-  if (g_mode == MODE_CARRUSEL && sd_ready && !g_images.empty() && ms - last_carousel_ms >= g_carouselMs) {
-    last_carousel_ms = ms;
+  // Carrusel automatico (RTC; infinito por modulo)
+  if (g_mode == MODE_CARRUSEL && sd_ready && !g_images.empty()
+      && (long)(nowSec - g_lastCarouselSec) >= (long)(g_carouselMs / 1000)) {
+    g_lastCarouselSec = nowSec;
     g_img_idx = (g_img_idx + 1) % g_images.size();
     g_needRedraw = true;
   }
@@ -1368,5 +1476,15 @@ void loop() {
 
   if (g_needRedraw && !g_busy) { g_needRedraw = false; drawCurrentMode(); }
 
-  if (!g_playing) delay(10);   // mientras suena la musica no metemos delay (audio fluido)
+  // Arranque rapido: la pantalla local ya esta pintada; ahora baja WiFi+NTP+AEMET UNA vez,
+  // en segundo plano. NO se repinta: el local se refresca solo en su ciclo (1/5 min, con la hora
+  // ya sincronizada por NTP) y las tarjetas AEMET se ven al navegar a una ciudad.
+  if (g_bootFetchPending && !g_needRedraw && !g_busy) {
+    g_bootFetchPending = false;
+    fetchAllOnline(true);
+  }
+
+  // Ahorro de bateria: light sleep en reposo, deep sleep tras 1h. (En musica reproduciendo no duerme.)
+  if (g_mode == MODE_MUSICA && g_playing) { /* sin delay: audio fluido */ }
+  else powerTick();
 }

@@ -10,7 +10,7 @@
 <p align="center">
   Firmware para el <b>M5Paper Color</b> (ESP32-S3, tinta electrónica a color) que reúne varias
   utilidades en un dispositivo de bajo consumo: estación meteorológica con predicción de
-  <b>AEMET</b>, marco de fotos, reproductor de música y (próximamente) lector de libros.
+  <b>AEMET</b>, marco de fotos, reproductor de música y lector de libros de texto.
   Incluye un <b>modo oculto TV-B-Gone</b> por infrarrojos. Todo se configura desde la microSD.
 </p>
 
@@ -83,11 +83,13 @@ Formatea en **FAT32** y crea esta estructura en la raíz:
 
   "carousel_seconds": 300,
   "photo_auto_rotate": true,
+  "deep_sleep_minutes": 60,
 
   "fotos_dir": "/Fotos",
   "musica_dir": "/Musica",
   "libros_dir": "/Libros",
   "font_title": "/fonts/title.vlw",
+  "font_body": "/fonts/body.vlw",
 
   "locations": [
     { "name": "Madrid",           "municipio": "28079", "estacion": "3126Y" },
@@ -104,6 +106,7 @@ Formatea en **FAT32** y crea esta estructura en la raíz:
 | `timezone` | POSIX TZ. Peninsular: `CET-1CEST,M3.5.0,M10.5.0/3` · Canarias: `WET0WEST,M3.5.0/1,M10.5.0`. |
 | `carousel_seconds` | Segundos entre fotos. |
 | `photo_auto_rotate` | `true` = gira el panel según la orientación de cada foto. |
+| `deep_sleep_minutes` | Minutos de inactividad antes de **apagarse** (deep sleep por PMIC). Se enciende con el botón de encendido. |
 | `fotos_dir`/`musica_dir`/`libros_dir` | Carpetas en la SD. |
 | `font_title` | Fuente VLW (con acentos) para los títulos. |
 | `font_body` | Fuente VLW (con acentos) para el lector de libros. |
@@ -175,6 +178,27 @@ parpadea **verde** al empezar y **rojo** al terminar (3 veces si se cancela con 
 
 Los códigos están en `M5PaperColor_Reloj/tvbgone_codes.h` (portados de
 [m5stick-weather-tvbgone](https://github.com/baltamir1978/m5stick-weather-tvbgone)).
+
+---
+
+## 🔋 Arranque y ahorro de energía
+
+**Arranque rápido.** Al encender, el reloj se muestra **enseguida** (hora del RTC + sensor, sin esperar
+a la red). La descarga de **WiFi + NTP + AEMET** se hace **en segundo plano** tras pintar la pantalla:
+no bloquea el arranque ni muestra mensajes de "Sin WiFi". La hora local se corrige sola en el siguiente
+refresco (1/5 min) y las predicciones AEMET aparecen al navegar a una localidad.
+
+**Reposo (light sleep).** En inactividad el equipo entra en *light sleep* y despierta solo con un
+botón o cuando toca el siguiente refresco. Transparente para el usuario.
+
+**Apagado por inactividad (deep sleep).** Tras `deep_sleep_minutes` sin tocar ningún botón, el equipo
+se **apaga de verdad** mediante el PMIC (`M5.Power.powerOff()`): consumo mínimo y **sin despertares
+fantasma**. La tinta electrónica **conserva la última imagen** aunque esté apagado. Para volver a
+encenderlo, pulsa el **botón de ENCENDIDO** (arranca de cero). Mientras se reproduce música, no se duerme.
+
+> 💡 Los tres botones de usuario (G1/UP/DOWN) son GPIO del ESP32 y su alimentación de *pull-up* se corta
+> al dormir, así que **no** pueden despertar de un apagado real; por eso el despertar fiable es el botón
+> de encendido, que cuelga directamente del PMIC.
 
 ---
 
@@ -266,8 +290,11 @@ pio device monitor  # monitor serie
 - [x] Modo oculto TV-B-Gone (IR + feedback LED)
 - [x] Modo libro **TXT** (selector + paginado + memoria por libro)
 - [x] Refresco LOCAL con cadencia inteligente (1 min; 5 min en reposo)
+- [x] Arranque rápido (pantalla local inmediata; WiFi/NTP/AEMET en segundo plano)
+- [x] Bajo consumo: *light sleep* en reposo + apagado por PMIC tras inactividad
 - [ ] Modo libro **EPUB** (descompresión ZIP + extracción de texto)
-- [ ] Modo de bajo consumo (deep sleep)
+- [ ] *Core 0* para refrescar sin bloquear botones durante los ~12 s de refresco
+- [ ] Alarma RTC para encender a una hora programada
 
 > ℹ️ **Sobre los refrescos:** el e-paper a color (Spectra 6) solo hace **refrescos completos**
 > (no admite refresco parcial de una región como los e-paper monocromos). Por eso la estrategia es

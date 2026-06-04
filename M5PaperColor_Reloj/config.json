@@ -19,6 +19,7 @@
   "font_body": "/fonts/body.vlw",
 
   "photo_auto_rotate": true,
+  "deep_sleep_minutes": 60,
 
   "locations": [
     { "name": "Madrid",           "municipio": "28079", "estacion": "3126Y" },
