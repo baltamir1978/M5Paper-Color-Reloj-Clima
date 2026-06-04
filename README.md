@@ -27,7 +27,7 @@
 - 🎵 **Música** — reproductor desde la SD (**MP3 / M4A / FLAC / WAV / AAC**) con el códec ES8311.
   Títulos con acentos correctos (fuente propia).
 - 📖 **Libro** — lector de **TXT** desde `/Libros` con selector de archivos y memoria de página por libro (EPUB próximamente).
-- 📶 **WiFi** — punto de acceso propio (se activa a mano) con **QR de conexión** y **gestor web de la microSD** (navegar, descargar, subir, editar, borrar, **galería** y **vídeo ligero** con streaming Range). Con login, sin router.
+- 📶 **WiFi** — **gestor web de la microSD** con login: se **une a tu red** (muestra la IP) o crea su **AP propio** con **QR**. Navegar, descargar, subir, editar, borrar, **galería** (con swipe/flechas) y **vídeo ligero** (streaming Range). Tema claro/oscuro y editor de `config.json` por formulario.
 - ⚙️ **Modos configurables** — activa/desactiva cualquier modo desde `config.json`; los desactivados se saltan.
 - 📺 **TV-B-Gone (modo oculto)** — apaga televisores por IR (108 códigos europeos).
 - 🕒 Hora por **NTP** mantenida en el **RTC**, con horario de verano automático.
@@ -216,30 +216,35 @@ encenderlo, pulsa el **botón de ENCENDIDO** (arranca de cero). Mientras se repr
 
 ## 📶 Modo WiFi (gestor de la microSD)
 
-El modo entra **apagado**. Pulsa **ARRIBA** para **activar** el punto de acceso (estilo *nomad*, sin
-router) y el **servidor web**; **ABAJO** lo apaga. Con el AP activo, la pantalla muestra **SSID**,
-**contraseña**, **IP** (http://192.168.4.1), **usuario/clave** del login y un **código QR** para que el
-móvil se **una a la red directamente** (apunta la cámara al QR).
+El modo entra **apagado**. Pulsa **ARRIBA** para activarlo; **ABAJO** lo apaga; **G1** sale del modo.
+Al activarlo decide solo cómo conectarse:
 
-1. En el modo WiFi, pulsa **ARRIBA** para encender el AP.
-2. Conéctate a la red (escaneando el **QR** o a mano con SSID/clave en pantalla).
-3. Abre `http://192.168.4.1`, introduce usuario/clave y **navega, descarga, sube, edita (texto) o borra**.
+- **Se une a tu WiFi** si alguna de las redes de `wifi[]` está disponible → la pantalla muestra la red, la
+  **IP asignada** (`http://<IP>`) y un **QR con esa URL**. Tu móvil/PC, en la misma red, abre esa dirección.
+- **Si no hay/conecta ninguna**, crea su **propio punto de acceso** (estilo *nomad*, sin router) → muestra
+  **SSID**, **contraseña**, `http://192.168.4.1` y un **QR para unirse a la red** directamente.
 
-Además incluye **Galería** (rejilla de imágenes con *lazy-load*) y **visor inline**: pulsa *ver* en una
-imagen o vídeo para verlo en el navegador. El servidor soporta **peticiones Range (HTTP 206)**, así que
-el `<video>` reproduce y permite avanzar (necesario en iOS) y las descargas grandes se pueden reanudar.
+En ambos casos abres la web, introduces **usuario/clave** del login y puedes **navegar, descargar, subir,
+editar (texto) o borrar**. Cada elemento tiene un menú **⋯** (Ver/Editar, Descargar, Borrar) y hay un
+botón **⬅ .. atrás** para subir de carpeta.
 
-El botón **Config** abre un editor de `config.json` (valida el JSON al guardar; reinicia para aplicar).
-Todo el gestor —incluida la edición de configuración— está **detrás del login**, así que las credenciales
-del `config.json` (WiFi, clave AEMET) no quedan expuestas a quien solo conozca la clave del AP.
+**Galería y visor.** El botón *Galería* muestra las imágenes en rejilla; al abrir una foto puedes pasar a
+la **anterior/siguiente** con **swipe** (móvil), **flechas ‹ ›** o el **teclado** (←/→, Esc). El servidor
+soporta **Range (HTTP 206)**, así que el `<video>` se reproduce y permite avanzar (necesario en iOS) y las
+descargas grandes se reanudan. Hay un **selector de tema claro/oscuro** (🌙/☀️) que recuerda tu preferencia.
 
-> 🎬 **Vídeo:** el decodifica el navegador del móvil; el equipo solo sirve los bytes. Como la microSD va
+> 🎬 **Vídeo:** lo decodifica el navegador del móvil; el equipo solo sirve los bytes. Como la microSD va
 > por **SPI** (no SDIO), el caudal es limitado: va bien con **clips ligeros** (MP4 H.264/AAC, ~480p), no con HD.
 
-Con el AP encendido no entra en reposo. **ABAJO** apaga el AP; **G1** sale del modo.
-Todo se configura en `wifi_modo` del `config.json` (la contraseña del AP debe tener **≥ 8 caracteres**).
+El botón **Configuración** abre un **formulario gráfico** (redes WiFi, AEMET y localidades, modos activos,
+carpetas/fuentes, ajustes del propio modo WiFi…) que **lee y reescribe `config.json`**; también hay un
+botón **{ } JSON** para el crudo. Reinicia el equipo para aplicar los cambios.
 
-> 🔒 El acceso está protegido por la contraseña del AP **y** por el login web; cámbialos en `config.json`.
+Con la conexión activa no entra en reposo. El AP/STA y la web se configuran en `wifi_modo` del
+`config.json` (la contraseña del AP debe tener **≥ 8 caracteres**).
+
+> 🔒 Todo el gestor —incluida la configuración— está **detrás del login**, así que las credenciales del
+> `config.json` (WiFi de casa, clave AEMET) no quedan expuestas a quien solo esté en la red.
 
 ---
 
@@ -336,7 +341,10 @@ pio device monitor  # monitor serie
 - [x] HOY ampliado: viento + racha, índice UV, previsión por horas
 - [x] Lector: alto de línea automático según el tamaño de `body.vlw`
 - [x] Modos activables/desactivables desde `config.json`
-- [x] Modo WiFi: AP propio + gestor web de la microSD (con login)
+- [x] Modo WiFi: se une a tu red (muestra IP) o crea AP propio; gestor web con login
+- [x] Web: galería con swipe/flechas, vídeo (Range/206), tema claro-oscuro, config por formulario
+- [ ] Galería: miniaturas con la **proporción real** de cada foto (no recortadas a cuadrado)
+- [ ] Vista de carpeta conmutable: **lista / detalles / miniaturas**
 - [ ] Modo libro **EPUB** (descompresión ZIP + extracción de texto)
 - [ ] Alarma RTC para encender a una hora programada
 

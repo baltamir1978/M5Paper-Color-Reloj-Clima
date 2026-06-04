@@ -43,8 +43,7 @@
 #include <HTTPClient.h>
 #include <WebServer.h>      // modo WiFi: gestor de la SD por web (AP propio)
 #include <ArduinoJson.h>
-#include <esp_sntp.h>
-#include <sntp.h>
+#include <esp_sntp.h>   // (sustituye al antiguo <sntp.h> de lwIP, ya obsoleto)
 #include <SPI.h>
 #include <SD.h>
 #include <Preferences.h>
@@ -103,6 +102,7 @@ bool     g_photoAutoRotate = true;   // girar el panel segun la orientacion de l
 WebServer g_server(80);
 File      g_upFile;                              // fichero en curso durante una subida
 bool      g_wifiModeOn = false;
+bool      g_apMode = false;                      // true=AP propio; false=unido a una red guardada (STA)
 String    g_apSsid  = DEF_AP_SSID;               // SSID del AP (config wifi_modo.ap_ssid)
 String    g_apPass  = DEF_AP_PASS;               // clave del AP (>=8 chars; wifi_modo.ap_pass)
 String    g_webUser = DEF_WEB_USER;              // login web (wifi_modo.user)
@@ -1495,10 +1495,14 @@ void handleUpload() {
 
 void startWifiMode() {
   audioPowerOff();
-  g_bootFetchPending = false;               // en modo AP no se hace la descarga STA de arranque
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_AP);
-  bool ok = WiFi.softAP(g_apSsid.c_str(), g_apPass.length() >= 8 ? g_apPass.c_str() : nullptr);
+  g_bootFetchPending = false;               // no se hace la descarga de arranque mientras se gestiona el WiFi
+  // 1) Intentar unirse a una red guardada (STA). 2) Si no hay/conecta, montar AP propio.
+  WiFi.mode(WIFI_STA);
+  g_apMode = !connectWiFi();
+  if (g_apMode) {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(g_apSsid.c_str(), g_apPass.length() >= 8 ? g_apPass.c_str() : nullptr);
+  }
   g_server.on("/", handleRoot);
   g_server.on("/list", handleList);
   g_server.on("/dl", handleDl);
@@ -1511,18 +1515,22 @@ void startWifiMode() {
   g_server.collectHeaders(HK, 1);
   g_server.begin();
   g_wifiModeOn = true;
-  Serial.printf("[WIFI] AP '%s' (%s) -> http://192.168.4.1  login=%s\n",
-                g_apSsid.c_str(), ok ? "ok" : "FALLO", g_webUser.c_str());
+  if (g_apMode)
+    Serial.printf("[WIFI] AP '%s' -> http://192.168.4.1  login=%s\n", g_apSsid.c_str(), g_webUser.c_str());
+  else
+    Serial.printf("[WIFI] STA '%s' -> http://%s  login=%s\n",
+                  WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), g_webUser.c_str());
 }
 
 void stopWifiMode() {
   if (!g_wifiModeOn) return;
   g_server.stop();
   if (g_upFile) g_upFile.close();        // cierra una subida a medias (deja la SD sin handles abiertos)
-  WiFi.softAPdisconnect(true);           // tira el AP
+  WiFi.softAPdisconnect(true);           // tira el AP (si lo habia)
+  WiFi.disconnect(true);                 // y desconecta la STA (si estaba unida)
   WiFi.mode(WIFI_OFF);                    // WiFi totalmente apagado
-  g_wifiModeOn = false;
-  Serial.println("[WIFI] AP detenido, SD libre.");
+  g_wifiModeOn = false; g_apMode = false;
+  Serial.println("[WIFI] detenido, SD libre.");
 }
 
 // Escapa el SSID/clave para la cadena QR de WiFi (\ ; , : " se preceden de \).
@@ -1540,44 +1548,46 @@ void drawWifi() {
   canvas.drawFastHLine(12, 42, W - 24, BLACK);
 
   if (!g_wifiModeOn) {
-    // -------- AP APAGADO --------
+    // -------- WIFI APAGADO --------
     canvas.setTextDatum(top_center);
     canvas.setFont(&fonts::FreeSansBold18pt7b); canvas.setTextColor(BLACK);
-    canvas.drawString("Punto de acceso", W / 2, 150);
+    canvas.drawString("Conexion WiFi", W / 2, 150);
     canvas.setTextColor(RED);
-    canvas.drawString("APAGADO", W / 2, 195);
-    canvas.setFont(&fonts::FreeSansBold12pt7b); canvas.setTextColor(BLACK);
-    canvas.drawString("Red: " + g_apSsid, W / 2, 290);
-    canvas.setTextColor(BLUE);
-    canvas.drawString("Pulsa ARRIBA para encenderlo", W / 2, 360);
+    canvas.drawString("APAGADA", W / 2, 195);
+    canvas.setFont(&fonts::FreeSans12pt7b); canvas.setTextColor(BLACK);
+    canvas.drawString("Se une a tu red WiFi si existe;", W / 2, 285);
+    canvas.drawString("si no, crea su propio punto de acceso.", W / 2, 312);
+    canvas.setFont(&fonts::FreeSansBold12pt7b); canvas.setTextColor(BLUE);
+    canvas.drawString("Pulsa ARRIBA para activar", W / 2, 372);
     canvas.setFont(&fonts::FreeSans9pt7b); canvas.setTextColor(BLACK); canvas.setTextDatum(bottom_center);
     canvas.drawString("G1: salir del modo WiFi", W / 2, H - 8);
     canvas.pushSprite(0, 0);
     return;
   }
 
-  // -------- AP ENCENDIDO: datos + QR --------
-  String ip = WiFi.softAPIP().toString();
+  // -------- WIFI ACTIVO: datos + QR (AP propio o unido a tu red) --------
+  String ip = g_apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
   canvas.setTextDatum(top_center);
   canvas.setFont(&fonts::FreeSansBold18pt7b); canvas.setTextColor(BLACK);
-  canvas.drawString("Red WiFi activa", W / 2, 54);
+  canvas.drawString(g_apMode ? "Punto de acceso" : "Conectado a tu WiFi", W / 2, 54);
   canvas.setFont(&fonts::FreeSansBold12pt7b); canvas.setTextColor(BLACK);
-  canvas.drawString("Red: " + g_apSsid, W / 2, 92);
-  canvas.drawString("Clave: " + g_apPass, W / 2, 116);
+  canvas.drawString("Red: " + (g_apMode ? g_apSsid : WiFi.SSID()), W / 2, 92);
+  if (g_apMode) canvas.drawString("Clave: " + g_apPass, W / 2, 116);
   canvas.setTextColor(RED);
   canvas.drawString("http://" + ip, W / 2, 142);
   canvas.setTextColor(BLACK);
   canvas.drawString("web: " + g_webUser + " / " + g_webPass, W / 2, 168);
 
-  // QR para unirse directamente a la red WiFi (formato estandar WIFI:...)
-  String qr = "WIFI:T:WPA;S:" + wifiQrEsc(g_apSsid) + ";P:" + wifiQrEsc(g_apPass) + ";;";
+  // QR: en AP -> unirse a la red (WIFI:...); en STA -> abrir la URL directamente.
+  String qr = g_apMode ? ("WIFI:T:WPA;S:" + wifiQrEsc(g_apSsid) + ";P:" + wifiQrEsc(g_apPass) + ";;")
+                       : ("http://" + ip);
   int L = qr.length();
-  uint8_t ver = (L <= 40) ? 4 : (L <= 60) ? 5 : (L <= 84) ? 6 : 8;
+  uint8_t ver = (L <= 25) ? 3 : (L <= 40) ? 4 : (L <= 60) ? 5 : (L <= 84) ? 6 : 8;
   int qw = 200, qx = (W - qw) / 2, qy = 198;
   canvas.fillRect(qx - 8, qy - 8, qw + 16, qw + 16, WHITE);
   canvas.qrcode(qr, qx, qy, qw, ver);
   canvas.setFont(&fonts::FreeSans12pt7b); canvas.setTextColor(BLACK);
-  canvas.drawString("Escanea para conectar el movil", W / 2, qy + qw + 14);
+  canvas.drawString(g_apMode ? "Escanea para unirte a la red" : "Escanea (misma red) o abre la URL", W / 2, qy + qw + 14);
 
   canvas.setFont(&fonts::FreeSans9pt7b); canvas.setTextDatum(bottom_center);
   canvas.drawString("ABAJO: apagar    G1: salir", W / 2, H - 8);
