@@ -13,6 +13,7 @@ build/
 *.bin
 *.elf
 *.hex
+*.ino.cpp        # lo genera PlatformIO en la carpeta del sketch; NO versionar (confunde a Arduino IDE)
 .pio/
 
 # Config local de VS Code / PlatformIO (rutas absolutas de la maquina)

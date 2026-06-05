@@ -105,6 +105,12 @@ bool     g_photoAutoRotate = true;   // girar el panel segun la orientacion de l
 // Modo WiFi (gestor de la SD por web, AP propio estilo "nomad")
 WebServer g_server(80);
 File      g_upFile;                              // fichero en curso durante una subida
+// Buffer de E/S del gestor web (descargas /dl y ZIP). En PSRAM y COMPARTIDO: el servidor es de un
+// solo hilo (nunca sirve dos peticiones a la vez), asi no gastamos ~40 KB de RAM interna en .bss.
+// Se reserva al encender el modo WiFi y se libera al apagarlo.
+#define   WEB_BUF_SZ 32768
+uint8_t*  g_webBuf = nullptr;
+size_t    g_webBufSz = 0;
 bool      g_wifiModeOn = false;
 bool      g_apMode = false;                      // true=AP propio; false=unido a una red guardada (STA)
 bool      g_wifiStaFetch = false;                // pendiente: refrescar AEMET aprovechando la STA del modo WiFi
@@ -1516,8 +1522,8 @@ void handleDl() {
     partial = true;
   }
 
-  static uint8_t buf[32768];
-  if (partial) {
+  uint8_t* buf = g_webBuf; size_t cap = g_webBufSz;   // buffer compartido en PSRAM (reservado en startWifiMode)
+  if (partial && buf) {
     size_t len = endByte - startByte + 1;
     f.seek(startByte);
     g_server.sendHeader("Content-Range", "bytes " + String((uint32_t)startByte) + "-" +
@@ -1527,7 +1533,7 @@ void handleDl() {
     WiFiClient client = g_server.client();
     size_t rem = len;
     while (rem > 0 && client.connected()) {
-      size_t n = f.read(buf, rem < sizeof(buf) ? rem : sizeof(buf));
+      size_t n = f.read(buf, rem < cap ? rem : cap);
       if (n == 0) break;
       client.write(buf, n);
       rem -= n;
@@ -1635,7 +1641,7 @@ static void zU16(WiFiClient& c, uint16_t v, uint32_t& pos) { uint8_t b[2] = {(ui
 static void zU32(WiFiClient& c, uint32_t v, uint32_t& pos) { uint8_t b[4] = {(uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16), (uint8_t)(v >> 24)}; c.write(b, 4); pos += 4; }
 static void zStr(WiFiClient& c, const String& s, uint32_t& pos) { c.write((const uint8_t*)s.c_str(), s.length()); pos += s.length(); }
 
-static void zipAddDir(WiFiClient& c, const String& full, const String& rel, uint32_t& pos, std::vector<ZipEnt>& cd, uint8_t* buf) {
+static void zipAddDir(WiFiClient& c, const String& full, const String& rel, uint32_t& pos, std::vector<ZipEnt>& cd, uint8_t* buf, size_t bufSz) {
   File dir = SD.open(full);
   if (!dir || !dir.isDirectory()) { if (dir) dir.close(); return; }
   for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
@@ -1643,7 +1649,7 @@ static void zipAddDir(WiFiClient& c, const String& full, const String& rel, uint
     bool isdir = f.isDirectory(); f.close();
     if (bn.length() && bn[0] == '.') continue;   // no incluir .thumbnails/.clima.cache en el ZIP
     if (!c.connected()) break;
-    if (isdir) { zipAddDir(c, fp, rel + bn + "/", pos, cd, buf); continue; }
+    if (isdir) { zipAddDir(c, fp, rel + bn + "/", pos, cd, buf, bufSz); continue; }
     String name = rel + bn;
     uint32_t off = pos;
     zU32(c, 0x04034b50, pos); zU16(c, 20, pos); zU16(c, 0x0008, pos); zU16(c, 0, pos);   // sig, ver, flag(descriptor), metodo(store)
@@ -1652,7 +1658,7 @@ static void zipAddDir(WiFiClient& c, const String& full, const String& rel, uint
     zU16(c, name.length(), pos); zU16(c, 0, pos); zStr(c, name, pos);
     uint32_t crc = 0xFFFFFFFF, sz = 0;
     File ff = SD.open(fp, FILE_READ);
-    if (ff) { while (ff.available()) { int n = ff.read(buf, 8192); if (n <= 0) break;
+    if (ff) { while (ff.available()) { int n = ff.read(buf, bufSz); if (n <= 0) break;
         c.write(buf, n); pos += n; crc = zipCrc(crc, buf, n); sz += n; if (!c.connected()) break; } ff.close(); }
     crc ^= 0xFFFFFFFF;
     zU32(c, 0x08074b50, pos); zU32(c, crc, pos); zU32(c, sz, pos); zU32(c, sz, pos);       // data descriptor
@@ -1671,8 +1677,9 @@ void handleZip() {
   // Longitud total desconocida -> respuesta con Connection: close (el navegador lee hasta el cierre).
   client.print(String("HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\n") +
                "Content-Disposition: attachment; filename=\"" + zn + ".zip\"\r\nConnection: close\r\n\r\n");
-  uint32_t pos = 0; std::vector<ZipEnt> cd; static uint8_t zbuf[8192];
-  zipAddDir(client, dir, "", pos, cd, zbuf);
+  uint32_t pos = 0; std::vector<ZipEnt> cd;
+  if (!g_webBuf) { client.stop(); return; }                  // sin buffer (no deberia pasar en modo WiFi)
+  zipAddDir(client, dir, "", pos, cd, g_webBuf, g_webBufSz);
   uint32_t cdoff = pos;
   for (auto& e : cd) {
     zU32(client, 0x02014b50, pos); zU16(client, 20, pos); zU16(client, 20, pos); zU16(client, 0x0008, pos); zU16(client, 0, pos);
@@ -1693,6 +1700,10 @@ void handleZip() {
 void startWifiMode() {
   audioPowerOff();
   g_bootFetchPending = false;               // no se hace la descarga de arranque mientras se gestiona el WiFi
+  if (!g_webBuf) {                          // buffer de E/S en PSRAM (con respaldo minimo en RAM interna)
+    g_webBuf = (uint8_t*)ps_malloc(WEB_BUF_SZ); g_webBufSz = g_webBuf ? WEB_BUF_SZ : 0;
+    if (!g_webBuf) { g_webBuf = (uint8_t*)malloc(8192); g_webBufSz = g_webBuf ? 8192 : 0; }
+  }
   // 1) Intentar unirse a una red guardada (STA). 2) Si no hay/conecta, montar AP propio.
   WiFi.mode(WIFI_STA);
   g_apMode = !connectWiFi();
@@ -1730,6 +1741,7 @@ void stopWifiMode() {
   WiFi.softAPdisconnect(true);           // tira el AP (si lo habia)
   WiFi.disconnect(true);                 // y desconecta la STA (si estaba unida)
   WiFi.mode(WIFI_OFF);                    // WiFi totalmente apagado
+  if (g_webBuf) { free(g_webBuf); g_webBuf = nullptr; g_webBufSz = 0; }   // libera el buffer de E/S
   g_wifiModeOn = false; g_apMode = false; g_wifiStaFetch = false;
   Serial.println("[WIFI] detenido, SD libre.");
 }

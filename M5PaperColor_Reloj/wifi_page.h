@@ -19,7 +19,6 @@ header h1{margin:0;font-size:17px;font-weight:600}
 .btn:hover{background:#2a3240}
 .btn.p{background:var(--acc);border-color:var(--acc);color:#fff}.btn.p:hover{background:var(--acch)}
 .btn.d{color:var(--red)}
-.txt{background:var(--card2);border:1px solid var(--line);color:var(--txt);border-radius:10px;padding:9px 11px;font-size:14px;width:130px}
 .list{padding:6px 8px 96px}
 .row{display:flex;align-items:center;gap:11px;padding:11px 8px;border-radius:12px}
 .row:hover{background:var(--card)}
