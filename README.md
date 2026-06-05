@@ -26,8 +26,8 @@
   panel** según la orientación de cada foto.
 - 🎵 **Música** — reproductor desde la SD (**MP3 / M4A / FLAC / WAV / AAC**) con el códec ES8311.
   Títulos con acentos correctos (fuente propia).
-- 📖 **Libro** — lector de **TXT** desde `/Libros` con selector de archivos y memoria de página por libro (EPUB próximamente).
-- 📶 **WiFi** — **gestor web de la microSD** con login: se **une a tu red** (muestra la IP) o crea su **AP propio** con **QR**. Navegar, descargar, subir, editar, borrar, **galería** (con swipe/flechas) y **vídeo ligero** (streaming Range). Tema claro/oscuro y editor de `config.json` por formulario.
+- 📖 **Libro** — lector de **TXT** desde `/Libros` con selector de archivos y memoria de página por libro (otros formatos: mejor descargarlos desde el gestor web).
+- 📶 **WiFi** — **gestor web de la microSD** con login: se **une a tu red** (muestra la IP) o crea su **AP propio** con **QR**. Navegar (lista/detalles/miniaturas), subir, editar, borrar, **descargar carpeta en ZIP**, ver fotos (proporción real, swipe), **vídeo ligero** y **mini‑reproductor de música**. Tema claro/oscuro y editor de `config.json` por formulario.
 - ⚙️ **Modos configurables** — activa/desactiva cualquier modo desde `config.json`; los desactivados se saltan.
 - 📺 **TV-B-Gone (modo oculto)** — apaga televisores por IR (108 códigos europeos).
 - 🕒 Hora por **NTP** mantenida en el **RTC**, con horario de verano automático.
@@ -68,7 +68,7 @@ Formatea en **FAT32** y crea esta estructura en la raíz:
 /config.json        ← configuración
 /Fotos/             ← imágenes del carrusel  (.jpg .jpeg .png .bmp)
 /Musica/            ← canciones  (.mp3 .m4a .flac .wav .aac)
-/Libros/            ← libros (.txt en UTF-8; .epub próximamente)
+/Libros/            ← libros (.txt en UTF-8)
 /fonts/title.vlw    ← fuente con acentos para los títulos
 /fonts/body.vlw     ← fuente con acentos para el lector de libros
 ```
@@ -221,17 +221,26 @@ Al activarlo decide solo cómo conectarse:
 
 - **Se une a tu WiFi** si alguna de las redes de `wifi[]` está disponible → la pantalla muestra la red, la
   **IP asignada** (`http://<IP>`) y un **QR con esa URL**. Tu móvil/PC, en la misma red, abre esa dirección.
+  Además, al estar conectado a internet, **aprovecha para refrescar la hora (NTP) y toda la predicción AEMET**.
 - **Si no hay/conecta ninguna**, crea su **propio punto de acceso** (estilo *nomad*, sin router) → muestra
   **SSID**, **contraseña**, `http://192.168.4.1` y un **QR para unirse a la red** directamente.
 
 En ambos casos abres la web, introduces **usuario/clave** del login y puedes **navegar, descargar, subir,
-editar (texto) o borrar**. Cada elemento tiene un menú **⋯** (Ver/Editar, Descargar, Borrar) y hay un
-botón **⬅ .. atrás** para subir de carpeta.
+editar (texto) o borrar**. Cada elemento tiene un menú **⋯** (Ver/Editar/Reproducir, Descargar, Borrar) y
+hay un botón **⬅ .. atrás**. La carpeta se puede ver en **lista / detalles / miniaturas** (☰ ≣ ▦, se recuerda).
 
-**Galería y visor.** El botón *Galería* muestra las imágenes en rejilla; al abrir una foto puedes pasar a
-la **anterior/siguiente** con **swipe** (móvil), **flechas ‹ ›** o el **teclado** (←/→, Esc). El servidor
-soporta **Range (HTTP 206)**, así que el `<video>` se reproduce y permite avanzar (necesario en iOS) y las
-descargas grandes se reanudan. Hay un **selector de tema claro/oscuro** (🌙/☀️) que recuerda tu preferencia.
+**Fotos, vídeo y música.**
+- **Fotos**: en *miniaturas* o al abrir una, se ven con su **proporción real**; pasas a la
+  **anterior/siguiente** con **swipe** (móvil), **flechas ‹ ›** o **teclado** (←/→, Esc). La vista de
+  **miniaturas usa las miniaturas de `.thumbnails/`** si las generas con `tools/make_thumbs.py` (carga
+  mucho más rápida; los vídeos muestran un fotograma). Si no hay, cae a la imagen original.
+- **Vídeo**: reproducción en el navegador con **Range (HTTP 206)** → permite avanzar (necesario en iOS).
+- **Música**: **mini‑reproductor** en una barra inferior que **sigue sonando mientras navegas**.
+
+**Descargar carpeta.** El botón **⬇ Carpeta (ZIP)** (o el menú ⋯ de una carpeta) descarga **toda la
+carpeta en un ZIP** (sin compresión, en streaming; incluye subcarpetas).
+
+Hay un **selector de tema claro/oscuro** (🌙/☀️) que recuerda tu preferencia.
 
 > 🎬 **Vídeo:** lo decodifica el navegador del móvil; el equipo solo sirve los bytes. Como la microSD va
 > por **SPI** (no SDIO), el caudal es limitado: va bien con **clips ligeros** (MP4 H.264/AAC, ~480p), no con HD.
@@ -324,6 +333,7 @@ pio device monitor  # monitor serie
 |--------|----------|
 | `make_vlw.py` | Genera la fuente `.vlw` con acentos desde un TTF (necesita `pip install freetype-py`). |
 | `aemet_estaciones.py` | Descarga el listado completo de estaciones AEMET a CSV (solo librería estándar). |
+| `make_thumbs.py` | Genera las **miniaturas** (`.thumbnails/`) de fotos y vídeos para que la vista de miniaturas del gestor web cargue rápido. `pip install pillow` (y `ffmpeg` para vídeos). Ej.: `python make_thumbs.py E:\`. **Truco:** cópialo a la **raíz de la microSD** y ejecútalo **sin argumentos** → escanea toda la tarjeta. |
 
 ---
 
@@ -342,11 +352,12 @@ pio device monitor  # monitor serie
 - [x] Lector: alto de línea automático según el tamaño de `body.vlw`
 - [x] Modos activables/desactivables desde `config.json`
 - [x] Modo WiFi: se une a tu red (muestra IP) o crea AP propio; gestor web con login
-- [x] Web: galería con swipe/flechas, vídeo (Range/206), tema claro-oscuro, config por formulario
-- [ ] Galería: miniaturas con la **proporción real** de cada foto (no recortadas a cuadrado)
-- [ ] Vista de carpeta conmutable: **lista / detalles / miniaturas**
-- [ ] Modo libro **EPUB** (descompresión ZIP + extracción de texto)
+- [x] Web: fotos (proporción real + swipe), vídeo (Range/206), tema claro-oscuro, config por formulario
+- [x] Web: vista **lista / detalles / miniaturas**, **mini-reproductor de música** y **descarga de carpeta en ZIP**
 - [ ] Alarma RTC para encender a una hora programada
+
+> 📖 **EPUB descartado:** es más útil **descargar** los libros desde el gestor web que visualizarlos en
+> la pantalla a color (refresco lento). El lector integrado se queda en **TXT**.
 
 > ℹ️ **Sobre los refrescos:** el e-paper a color (Spectra 6) solo hace **refrescos completos**
 > (no admite refresco parcial de una región como los e-paper monocromos). Por eso la estrategia es

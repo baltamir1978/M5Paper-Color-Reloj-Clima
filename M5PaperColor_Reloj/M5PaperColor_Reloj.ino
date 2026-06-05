@@ -76,6 +76,8 @@ static constexpr int PIN_BTN_MODE = 1, PIN_BTN_UP = 9, PIN_BTN_DOWN = 10;
 static constexpr int SHT_SDA_PIN = 3, SHT_SCL_PIN = 2;
 static constexpr int SD_SCK_PIN = 15, SD_MISO_PIN = 14, SD_MOSI_PIN = 13, SD_CS_PIN = 47;
 #define CONFIG_PATH "/config.json"
+#define CLIMA_CACHE_PATH "/.clima.cache"   // cache de g_clima en SD (sobrevive al apagado)
+#define CLIMA_CACHE_VER  1
 #define DEF_FOTOS_DIR  "/Fotos"
 #define DEF_MUSICA_DIR "/Musica"
 #define DEF_AP_SSID  "PaperColor"        // modo WiFi: SSID del AP por defecto (config wifi_modo.ap_ssid)
@@ -103,6 +105,7 @@ WebServer g_server(80);
 File      g_upFile;                              // fichero en curso durante una subida
 bool      g_wifiModeOn = false;
 bool      g_apMode = false;                      // true=AP propio; false=unido a una red guardada (STA)
+bool      g_wifiStaFetch = false;                // pendiente: refrescar AEMET aprovechando la STA del modo WiFi
 String    g_apSsid  = DEF_AP_SSID;               // SSID del AP (config wifi_modo.ap_ssid)
 String    g_apPass  = DEF_AP_PASS;               // clave del AP (>=8 chars; wifi_modo.ap_pass)
 String    g_webUser = DEF_WEB_USER;              // login web (wifi_modo.user)
@@ -303,7 +306,8 @@ void loadImageList(const char* dirpath) {
 }
 bool initSD() {
   SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
-  if (!SD.begin(SD_CS_PIN, SPI, 20000000)) { Serial.println("microSD no detectada."); return false; }
+  // max_files=10: la descarga ZIP recursiva abre un handle por nivel de carpeta (por defecto solo 5).
+  if (!SD.begin(SD_CS_PIN, SPI, 20000000, "/sd", 10)) { Serial.println("microSD no detectada."); return false; }
   Serial.println("microSD montada.");
   return true;
 }
@@ -637,10 +641,31 @@ bool aemetFetchHoraria(int idx) {
   return cc.nHours > 0;
 }
 
-// Descarga (NTP + prediccion + observacion + horaria) de todas las ubicaciones.
-// Sin aviso si no hay WiFi: el clima ya delata el fallo (sin datos / hora de actualizacion vieja).
-void fetchAllOnline(bool withNtp) {
-  if (!connectWiFi()) return;
+// Cache de clima en SD (ClimaCache es POD: char[]/int/float/bool, sin String -> volcado binario estable).
+// Sobrevive al apagado: al encender se muestran los ultimos datos al instante, antes de bajar los nuevos.
+void saveClima() {
+  if (!sd_ready) return;
+  File f = SD.open(CLIMA_CACHE_PATH, FILE_WRITE);
+  if (!f) return;
+  uint8_t hdr[4] = {'C', 'L', CLIMA_CACHE_VER, (uint8_t)numLocs()};
+  f.write(hdr, 4);
+  for (int i = 0; i < numLocs(); i++) f.write((const uint8_t*)&g_clima[i], sizeof(ClimaCache));
+  f.close();
+}
+void loadClima() {
+  if (!sd_ready) return;
+  File f = SD.open(CLIMA_CACHE_PATH, FILE_READ);
+  if (!f) return;
+  uint8_t hdr[4];
+  if (f.read(hdr, 4) == 4 && hdr[0] == 'C' && hdr[1] == 'L' && hdr[2] == CLIMA_CACHE_VER && hdr[3] == numLocs()) {
+    for (int i = 0; i < numLocs(); i++) f.read((uint8_t*)&g_clima[i], sizeof(ClimaCache));
+    Serial.println("Clima: cache de la SD cargada.");
+  }
+  f.close();
+}
+
+// Descarga NTP + prediccion + observacion + horaria de TODAS las ubicaciones (asume WiFi ya conectado).
+void fetchWeatherData(bool withNtp) {
   if (withNtp) syncRtcFromSntp();
   if (g_apiKey.length() > 0) {
     for (int i = 0; i < numLocs(); i++) {   // sin refrescos por ciudad (el e-paper es lento)
@@ -649,7 +674,15 @@ void fetchAllOnline(bool withNtp) {
       aemetFetchObs(i);
       aemetFetchHoraria(i);
     }
+    saveClima();   // persiste lo descargado (incluye la hora de actualizacion AEMET de cada ciudad)
   }
+}
+
+// Conecta el WiFi, baja todo y vuelve a apagar el WiFi (uso a demanda: arranque y "mantener G1").
+// Sin aviso si no hay WiFi: el clima ya delata el fallo (sin datos / hora de actualizacion vieja).
+void fetchAllOnline(bool withNtp) {
+  if (!connectWiFi()) return;
+  fetchWeatherData(withNtp);
   wifiOff();
 }
 
@@ -1371,6 +1404,12 @@ static String webContentType(const String& p) {
   if (n.endsWith(".mov")) return "video/quicktime";
   if (n.endsWith(".webm")) return "video/webm";
   if (n.endsWith(".mkv")) return "video/x-matroska";
+  if (n.endsWith(".mp3")) return "audio/mpeg";
+  if (n.endsWith(".m4a")) return "audio/mp4";        // AAC en contenedor MP4
+  if (n.endsWith(".aac")) return "audio/aac";
+  if (n.endsWith(".wav")) return "audio/wav";
+  if (n.endsWith(".flac")) return "audio/flac";
+  if (n.endsWith(".ogg") || n.endsWith(".oga")) return "audio/ogg";
   if (n.endsWith(".txt")||n.endsWith(".json")||n.endsWith(".csv")||n.endsWith(".md")||n.endsWith(".log")||
       n.endsWith(".cfg")||n.endsWith(".ino")||n.endsWith(".h")||n.endsWith(".c")||n.endsWith(".js")||n.endsWith(".xml"))
     return "text/plain; charset=utf-8";
@@ -1388,6 +1427,7 @@ void handleList() {
     bool first = true;
     for (File f = d.openNextFile(); f; f = d.openNextFile()) {
       String nm = f.name(); int sl = nm.lastIndexOf('/'); if (sl >= 0) nm = nm.substring(sl + 1);
+      if (nm.length() && nm[0] == '.') { f.close(); continue; }   // ocultar .thumbnails, .clima.cache, etc.
       if (!first) out += ","; first = false;
       out += "{\"name\":\"" + jsonEsc(nm) + "\",\"size\":" + String((uint32_t)f.size()) +
              ",\"dir\":" + (f.isDirectory() ? "true" : "false") + "}";
@@ -1453,6 +1493,23 @@ void handleDl() {
   f.close();
 }
 
+// Miniatura: sirve <carpeta>/.thumbnails/<nombre-sin-ext>.jpg si existe; si no, el original.
+// Las miniaturas las genera tools/make_thumbs.py al preparar la SD.
+void handleThumb() {
+  if (!webAuth()) return;
+  String path = g_server.arg("path");
+  int sl = path.lastIndexOf('/');
+  String dir = (sl >= 0) ? path.substring(0, sl) : "";
+  String name = (sl >= 0) ? path.substring(sl + 1) : path;
+  int dot = name.lastIndexOf('.'); if (dot > 0) name = name.substring(0, dot);
+  String tp = dir + "/.thumbnails/" + name + ".jpg";
+  String serve = SD.exists(tp) ? tp : path;
+  File f = SD.open(serve, FILE_READ);
+  if (!f || f.isDirectory()) { if (f) f.close(); g_server.send(404, "text/plain", "no"); return; }
+  g_server.streamFile(f, webContentType(serve));
+  f.close();
+}
+
 void handleRm() {
   if (!webAuth()) return;
   String path = g_server.arg("path");
@@ -1493,6 +1550,75 @@ void handleUpload() {
   }
 }
 
+// --- Descargar carpeta como ZIP (metodo "store", sin compresion, en streaming) ---
+// Usa "data descriptor" (flag 0x08) para no necesitar el CRC/tamano antes de enviar los datos.
+struct ZipEnt { String name; uint32_t crc, size, off; };
+static uint32_t s_crcTab[256]; static bool s_crcInit = false;
+static uint32_t zipCrc(uint32_t crc, const uint8_t* d, size_t n) {
+  if (!s_crcInit) { for (uint32_t i = 0; i < 256; i++) { uint32_t c = i;
+      for (int k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88520 ^ (c >> 1)) : (c >> 1); s_crcTab[i] = c; } s_crcInit = true; }
+  for (size_t i = 0; i < n; i++) crc = s_crcTab[(crc ^ d[i]) & 0xFF] ^ (crc >> 8);
+  return crc;
+}
+static void zU16(WiFiClient& c, uint16_t v, uint32_t& pos) { uint8_t b[2] = {(uint8_t)v, (uint8_t)(v >> 8)}; c.write(b, 2); pos += 2; }
+static void zU32(WiFiClient& c, uint32_t v, uint32_t& pos) { uint8_t b[4] = {(uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16), (uint8_t)(v >> 24)}; c.write(b, 4); pos += 4; }
+static void zStr(WiFiClient& c, const String& s, uint32_t& pos) { c.write((const uint8_t*)s.c_str(), s.length()); pos += s.length(); }
+
+static void zipAddDir(WiFiClient& c, const String& full, const String& rel, uint32_t& pos, std::vector<ZipEnt>& cd, uint8_t* buf) {
+  File dir = SD.open(full);
+  if (!dir || !dir.isDirectory()) { if (dir) dir.close(); return; }
+  for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+    String fp = f.path(); String bn = fp; int sl = bn.lastIndexOf('/'); if (sl >= 0) bn = bn.substring(sl + 1);
+    bool isdir = f.isDirectory(); f.close();
+    if (bn.length() && bn[0] == '.') continue;   // no incluir .thumbnails/.clima.cache en el ZIP
+    if (!c.connected()) break;
+    if (isdir) { zipAddDir(c, fp, rel + bn + "/", pos, cd, buf); continue; }
+    String name = rel + bn;
+    uint32_t off = pos;
+    zU32(c, 0x04034b50, pos); zU16(c, 20, pos); zU16(c, 0x0008, pos); zU16(c, 0, pos);   // sig, ver, flag(descriptor), metodo(store)
+    zU16(c, 0, pos); zU16(c, 0, pos);                                                     // hora, fecha
+    zU32(c, 0, pos); zU32(c, 0, pos); zU32(c, 0, pos);                                     // crc, comp, uncomp (van en el descriptor)
+    zU16(c, name.length(), pos); zU16(c, 0, pos); zStr(c, name, pos);
+    uint32_t crc = 0xFFFFFFFF, sz = 0;
+    File ff = SD.open(fp, FILE_READ);
+    if (ff) { while (ff.available()) { int n = ff.read(buf, 8192); if (n <= 0) break;
+        c.write(buf, n); pos += n; crc = zipCrc(crc, buf, n); sz += n; if (!c.connected()) break; } ff.close(); }
+    crc ^= 0xFFFFFFFF;
+    zU32(c, 0x08074b50, pos); zU32(c, crc, pos); zU32(c, sz, pos); zU32(c, sz, pos);       // data descriptor
+    cd.push_back({name, crc, sz, off});
+    if (!c.connected()) break;
+  }
+  dir.close();
+}
+
+void handleZip() {
+  if (!webAuth()) return;
+  String dir = g_server.hasArg("dir") ? g_server.arg("dir") : "/";
+  if (dir.length() > 1 && dir.endsWith("/")) dir = dir.substring(0, dir.length() - 1);
+  String zn = dir; int sl = zn.lastIndexOf('/'); zn = (sl >= 0) ? zn.substring(sl + 1) : zn; if (zn.length() == 0) zn = "microSD";
+  WiFiClient client = g_server.client();
+  // Longitud total desconocida -> respuesta con Connection: close (el navegador lee hasta el cierre).
+  client.print(String("HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\n") +
+               "Content-Disposition: attachment; filename=\"" + zn + ".zip\"\r\nConnection: close\r\n\r\n");
+  uint32_t pos = 0; std::vector<ZipEnt> cd; static uint8_t zbuf[8192];
+  zipAddDir(client, dir, "", pos, cd, zbuf);
+  uint32_t cdoff = pos;
+  for (auto& e : cd) {
+    zU32(client, 0x02014b50, pos); zU16(client, 20, pos); zU16(client, 20, pos); zU16(client, 0x0008, pos); zU16(client, 0, pos);
+    zU16(client, 0, pos); zU16(client, 0, pos);
+    zU32(client, e.crc, pos); zU32(client, e.size, pos); zU32(client, e.size, pos);
+    zU16(client, e.name.length(), pos); zU16(client, 0, pos); zU16(client, 0, pos);
+    zU16(client, 0, pos); zU16(client, 0, pos); zU32(client, 0, pos);
+    zU32(client, e.off, pos); zStr(client, e.name, pos);
+  }
+  uint32_t cdsize = pos - cdoff;
+  zU32(client, 0x06054b50, pos); zU16(client, 0, pos); zU16(client, 0, pos);
+  zU16(client, cd.size(), pos); zU16(client, cd.size(), pos);
+  zU32(client, cdsize, pos); zU32(client, cdoff, pos); zU16(client, 0, pos);
+  client.stop();
+  Serial.printf("[WIFI] ZIP %s: %u ficheros, %u bytes\n", zn.c_str(), (unsigned)cd.size(), (unsigned)pos);
+}
+
 void startWifiMode() {
   audioPowerOff();
   g_bootFetchPending = false;               // no se hace la descarga de arranque mientras se gestiona el WiFi
@@ -1502,12 +1628,16 @@ void startWifiMode() {
   if (g_apMode) {
     WiFi.mode(WIFI_AP);
     WiFi.softAP(g_apSsid.c_str(), g_apPass.length() >= 8 ? g_apPass.c_str() : nullptr);
+  } else {
+    g_wifiStaFetch = true;   // unidos a tu red: aprovechamos para refrescar AEMET (en el loop, tras pintar)
   }
   g_server.on("/", handleRoot);
   g_server.on("/list", handleList);
   g_server.on("/dl", handleDl);
+  g_server.on("/thumb", handleThumb);
   g_server.on("/rm", handleRm);
   g_server.on("/mkdir", handleMkdir);
+  g_server.on("/zip", handleZip);
   g_server.on("/save", HTTP_POST, handleSave);
   g_server.on("/up", HTTP_POST, []() { g_server.send(200, "text/plain", "ok"); }, handleUpload);
   g_server.onNotFound([]() { g_server.send(404, "text/plain", "404"); });
@@ -1529,7 +1659,7 @@ void stopWifiMode() {
   WiFi.softAPdisconnect(true);           // tira el AP (si lo habia)
   WiFi.disconnect(true);                 // y desconecta la STA (si estaba unida)
   WiFi.mode(WIFI_OFF);                    // WiFi totalmente apagado
-  g_wifiModeOn = false; g_apMode = false;
+  g_wifiModeOn = false; g_apMode = false; g_wifiStaFetch = false;
   Serial.println("[WIFI] detenido, SD libre.");
 }
 
@@ -1805,6 +1935,7 @@ void setup() {
   loadDefaults();
   loadConfig();                          // sobreescribe defaults si hay /config.json
   g_clima.assign(numLocs(), ClimaCache{});
+  loadClima();                           // recupera la ultima prediccion guardada (se ve al instante)
   scanImages();                          // lista fotos de la carpeta configurada (/Fotos)
   scanMusic();                           // lista canciones de /Musica
   scanBooks();                           // lista libros .txt de /Libros
@@ -1920,8 +2051,12 @@ void loop() {
     fetchAllOnline(true);
   }
 
-  // Modo WiFi con AP encendido: atender el servidor web (no se duerme). Resto: ahorro.
-  if (g_mode == MODE_WIFI && g_wifiModeOn) { g_server.handleClient(); }
+  // Modo WiFi con AP/STA encendido: atender el servidor web (no se duerme). Resto: ahorro.
+  if (g_mode == MODE_WIFI && g_wifiModeOn) {
+    // Si nos unimos a TU red (STA), aprovechamos una vez para refrescar NTP + AEMET de todas las ciudades.
+    if (g_wifiStaFetch) { g_wifiStaFetch = false; Serial.println("[WIFI] STA: refrescando AEMET..."); fetchWeatherData(true); }
+    g_server.handleClient();
+  }
   else if (g_mode == MODE_MUSICA && g_playing) { /* sin delay: audio fluido */ }
   else powerTick();
 }
