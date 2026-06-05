@@ -1510,12 +1510,35 @@ void handleThumb() {
   f.close();
 }
 
+// Borrado recursivo: vacia la carpeta (archivos y subcarpetas, incluido .thumbnails) y luego la elimina.
+bool rmrf(const String& path) {
+  File f = SD.open(path);
+  if (!f) return false;
+  if (!f.isDirectory()) { f.close(); return SD.remove(path); }
+  for (File c = f.openNextFile(); c; c = f.openNextFile()) {
+    String cp = c.path(); c.close();
+    rmrf(cp);
+  }
+  f.close();
+  return SD.rmdir(path);
+}
+// Borra la miniatura asociada a un fichero (si existe), para no dejarla huerfana.
+void removeThumb(const String& path) {
+  int sl = path.lastIndexOf('/'); String dir = (sl >= 0) ? path.substring(0, sl) : "";
+  String name = (sl >= 0) ? path.substring(sl + 1) : path;
+  int dot = name.lastIndexOf('.'); if (dot > 0) name = name.substring(0, dot);
+  String tp = dir + "/.thumbnails/" + name + ".jpg";
+  if (SD.exists(tp)) SD.remove(tp);
+}
 void handleRm() {
   if (!webAuth()) return;
   String path = g_server.arg("path");
-  bool ok = false;
   File f = SD.open(path);
-  if (f) { bool isd = f.isDirectory(); f.close(); ok = isd ? SD.rmdir(path) : SD.remove(path); }
+  if (!f) { g_server.send(404, "text/plain", "no existe"); return; }
+  bool isd = f.isDirectory(); f.close();
+  bool ok;
+  if (isd) ok = rmrf(path);
+  else { ok = SD.remove(path); removeThumb(path); }
   g_server.send(ok ? 200 : 500, "text/plain", ok ? "ok" : "error");
 }
 

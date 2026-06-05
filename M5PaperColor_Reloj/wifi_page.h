@@ -168,10 +168,10 @@ function menu(p,k,name){var h="<div class=h>"+name+"</div>";
  if(k==="a")h+="<button class=it onclick=\"closeSheet();playAudio('"+ec(p)+"')\">🎵 Reproducir</button>";
  if(k==="t")h+="<button class=it onclick=\"closeSheet();ed('"+ec(p)+"')\">✏️ Editar</button>";
  if(k!=="d")h+="<a class=it href=\"/dl?path="+u(p)+"&dl=1\" onclick=\"closeSheet()\">⬇ Descargar</a>";
- h+="<button class='it d' onclick=\"closeSheet();rm('"+ec(p)+"')\">🗑️ Borrar</button>";
+ h+="<button class='it d' onclick=\"closeSheet();rm('"+ec(p)+"',"+(k==="d"?1:0)+")\">🗑️ Borrar</button>";
  document.getElementById("spanel").innerHTML=h;document.getElementById("sheet").style.display="block";}
 function closeSheet(){document.getElementById("sheet").style.display="none"}
-function rm(p){if(confirm("¿Borrar "+p+" ?"))F("/rm?path="+u(p)).then(function(){ld(cwd)})}
+function rm(p,d){if(!confirm(d?("¿Borrar la carpeta «"+p+"» y TODO su contenido?"):("¿Borrar "+p+" ?")))return;F("/rm?path="+u(p)).then(function(){ld(cwd)})}
 function mk(){var n=prompt("Nombre de la carpeta nueva:");if(!n||!(n=n.trim()))return;F("/mkdir?path="+u((cwd==="/"?"":cwd)+"/"+n)).then(function(){ld(cwd)})}
 function up(){var fi=document.getElementById("f"),f=fi.files[0];if(!f)return;var fd=new FormData();fd.append("f",f);F("/up?dir="+u(cwd),{method:"POST",body:fd}).then(function(){fi.value="";ld(cwd)})}
 function arrows(){var s=(g_isImg&&g_imgs.length>1)?"block":"none";document.getElementById("vprev").style.display=s;document.getElementById("vnext").style.display=s}
