@@ -421,6 +421,16 @@ void showBusy(const char* msg) {
 }
 
 // ============================ AEMET ============================
+// GET con reintentos ante el 429 (AEMET limita las peticiones): espera y reintenta re-abriendo.
+int aemetGET(HTTPClient& h, WiFiClientSecure& c, const String& url) {
+  for (int t = 0; t < 3; t++) {
+    if (t > 0) { h.end(); delay(2000 * t); h.begin(c, url); }   // backoff 2s, 4s
+    int code = h.GET();
+    if (code != 429) return code;
+    Serial.printf("AEMET 429 (reintento %d)...\n", t + 1);
+  }
+  return 429;
+}
 bool aemetFetch(int idx) {
   if (g_apiKey.length() == 0) return false;
   String url = String("https://opendata.aemet.es/opendata/api/prediccion/especifica/municipio/diaria/")
@@ -428,7 +438,7 @@ bool aemetFetch(int idx) {
   WiFiClientSecure c1; c1.setInsecure();
   HTTPClient h1;
   if (!h1.begin(c1, url)) return false;
-  int code = h1.GET();
+  int code = aemetGET(h1, c1, url);
   if (code != 200) { Serial.printf("AEMET paso1 HTTP %d\n", code); h1.end(); return false; }
   JsonDocument meta; deserializeJson(meta, h1.getStream()); h1.end();
   String datos = meta["datos"] | "";
@@ -437,7 +447,7 @@ bool aemetFetch(int idx) {
   WiFiClientSecure c2; c2.setInsecure();
   HTTPClient h2;
   if (!h2.begin(c2, datos)) return false;
-  if (h2.GET() != 200) { h2.end(); return false; }
+  if (aemetGET(h2, c2, datos) != 200) { h2.end(); return false; }
 
   JsonDocument filter;
   JsonObject dia = filter[0]["prediccion"]["dia"][0].to<JsonObject>();
@@ -518,7 +528,7 @@ bool aemetFetchObs(int idx) {
   WiFiClientSecure c1; c1.setInsecure();
   HTTPClient h1;
   if (!h1.begin(c1, url)) return false;
-  if (h1.GET() != 200) { h1.end(); return false; }
+  if (aemetGET(h1, c1, url) != 200) { h1.end(); return false; }
   JsonDocument meta; deserializeJson(meta, h1.getStream()); h1.end();
   String datos = meta["datos"] | "";
   if (datos.isEmpty()) return false;
@@ -526,7 +536,7 @@ bool aemetFetchObs(int idx) {
   WiFiClientSecure c2; c2.setInsecure();
   HTTPClient h2;
   if (!h2.begin(c2, datos)) return false;
-  if (h2.GET() != 200) { h2.end(); return false; }
+  if (aemetGET(h2, c2, datos) != 200) { h2.end(); return false; }
 
   JsonDocument filter;
   JsonObject o = filter[0].to<JsonObject>();
@@ -584,7 +594,7 @@ bool aemetFetchHoraria(int idx) {
   WiFiClientSecure c1; c1.setInsecure();
   HTTPClient h1; h1.setTimeout(20000); h1.setConnectTimeout(15000);
   if (!h1.begin(c1, url)) { Serial.println("HORARIA: begin paso1 fallo"); return false; }
-  int code1 = h1.GET();
+  int code1 = aemetGET(h1, c1, url);
   if (code1 != 200) { Serial.printf("HORARIA paso1 HTTP %d\n", code1); h1.end(); return false; }
   JsonDocument meta; deserializeJson(meta, h1.getStream()); h1.end();
   String datos = meta["datos"] | "";
@@ -593,7 +603,7 @@ bool aemetFetchHoraria(int idx) {
   WiFiClientSecure c2; c2.setInsecure();
   HTTPClient h2; h2.setTimeout(20000); h2.setConnectTimeout(15000);   // horaria es grande: mas timeout
   if (!h2.begin(c2, datos)) { Serial.println("HORARIA: begin paso2 fallo"); return false; }
-  int code2 = h2.GET();
+  int code2 = aemetGET(h2, c2, datos);
   if (code2 != 200) { Serial.printf("HORARIA paso2 HTTP %d\n", code2); h2.end(); return false; }
 
   // Volcar el cuerpo completo a PSRAM (de-trocea) y parsear desde ahi.
@@ -670,9 +680,10 @@ void fetchWeatherData(bool withNtp) {
   if (g_apiKey.length() > 0) {
     for (int i = 0; i < numLocs(); i++) {   // sin refrescos por ciudad (el e-paper es lento)
       Serial.printf("Descargando %s...\n", g_locs[i].name.c_str());
-      aemetFetch(i);
-      aemetFetchObs(i);
+      aemetFetch(i);       delay(600);
+      aemetFetchObs(i);    delay(600);
       aemetFetchHoraria(i);
+      if (i < numLocs() - 1) delay(1200);   // respiro entre ciudades: AEMET limita peticiones rapidas (HTTP 429)
     }
     saveClima();   // persiste lo descargado (incluye la hora de actualizacion AEMET de cada ciudad)
   }
@@ -2064,7 +2075,10 @@ void loop() {
   // Fin de pista -> siguiente (lo marca el callback evt_eof de la libreria)
   if (g_trackEnded) { g_trackEnded = false; if (g_playing) musicNext(); }
 
-  if (g_needRedraw && !g_busy) { g_needRedraw = false; drawCurrentMode(); }
+  // El contador de inactividad para el LIGHT SLEEP arranca al TERMINAR el dibujo (no al pulsar):
+  // como el refresco tarda ~12s (> IDLE_SLEEP_MS), si no, se dormiria justo tras pintar y la
+  // siguiente pulsacion solo "despertaria" sin navegar. Asi queda despierto un margen tras cada refresco.
+  if (g_needRedraw && !g_busy) { g_needRedraw = false; drawCurrentMode(); g_lastInput = millis(); }
 
   // Arranque rapido: la pantalla local ya esta pintada; ahora baja WiFi+NTP+AEMET UNA vez,
   // en segundo plano. NO se repinta: el local se refresca solo en su ciclo (1/5 min, con la hora
