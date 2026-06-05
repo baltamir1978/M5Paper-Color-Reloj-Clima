@@ -1,9 +1,10 @@
 # Datos de sesion / memoria de Claude
 .claude/
 
-# Artefactos de Python (ensurepip) creados accidentalmente en la carpeta
-Lib/
-Scripts/
+# Artefactos de Python (ensurepip) creados accidentalmente en la RAIZ.
+# Anclados con "/" para no pillar tools/sdcard/lib/ (Windows trata Lib==lib).
+/Lib/
+/Scripts/
 __pycache__/
 *.pyc
 

@@ -54,6 +54,8 @@ header h1{margin:0;font-size:17px;font-weight:600}
 .modal .bd{flex:1;overflow:auto}
 .modal .bdc{flex:1;display:flex;justify-content:center;align-items:center;overflow:auto;padding:10px}
 .modal .bdc img,.modal .bdc video{max-width:100%;max-height:100%;border-radius:8px}
+#eparea{flex:1;background:#fff;overflow:hidden}
+#eparea .muted{color:#555}
 #player{display:none;position:fixed;left:0;right:0;bottom:0;z-index:15;background:var(--card);border-top:1px solid var(--line);padding:8px 10px;flex-direction:column;box-shadow:0 -2px 10px rgba(0,0,0,.4)}
 #player.on{display:flex}
 #player .prow{display:flex;align-items:center;gap:8px}
@@ -106,6 +108,11 @@ header h1{margin:0;font-size:17px;font-weight:600}
  <button class="btn" onclick="cfgRaw()">{ } JSON</button><button class="btn p" onclick="cfgSave()">💾 Guardar</button><button class="btn" onclick="cfgClose()">✕</button></div>
  <div class="bd" id="cfgbd"></div></div>
 
+<div class="modal" id="epov"><div class="bar"><span class="t" id="eptt">Leer</span>
+ <button class="btn" onclick="epPrev()">‹ Anterior</button><button class="btn" onclick="epNext()">Siguiente ›</button>
+ <button class="btn" onclick="epClose()">✕ Cerrar</button></div>
+ <div id="eparea"></div></div>
+
 <div class="sheet" id="sheet" onclick="if(event.target==this)closeSheet()"><div class="panel" id="spanel"></div></div>
 
 <div id="player"><div class="prow"><span class="pn" id="ptt"></span><button class="btn" onclick="pstop()" style="padding:5px 11px">✕</button></div><audio id="pau" controls></audio></div>
@@ -114,15 +121,15 @@ header h1{margin:0;font-size:17px;font-weight:600}
 var cwd="/";
 var g_imgs=[],g_ii=0,g_isImg=false;
 var g_ents=[],g_dir="/",g_vm="details";   // entradas de la carpeta + modo de vista (list/details/thumbs)
-var IMG=/\.(jpg|jpeg|png|gif|bmp|webp)$/i,VID=/\.(mp4|mov|m4v|webm|mkv)$/i,AUD=/\.(mp3|m4a|flac|wav|aac|ogg)$/i,TXT=/\.(txt|json|csv|cfg|md|ino|h|c|log|xml|html|js)$/i;
+var IMG=/\.(jpg|jpeg|png|gif|bmp|webp)$/i,VID=/\.(mp4|mov|m4v|webm|mkv)$/i,AUD=/\.(mp3|m4a|flac|wav|aac|ogg)$/i,TXT=/\.(txt|json|csv|cfg|md|ino|h|c|log|xml|js)$/i,PDF=/\.pdf$/i,EPB=/\.epub$/i,WEBV=/\.(svg|html?)$/i;
 var nbusy=0;
 function busy(b){nbusy=Math.max(0,nbusy+(b?1:-1));document.getElementById("prog").className=nbusy?"on":""}
 function F(uu,oo){busy(true);return fetch(uu,oo).finally(function(){busy(false)})}
 function ec(s){return s.replace(/'/g,"\\'")}
 function at(s){return (s==null?"":(""+s)).replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;")}
 function u(p){return encodeURIComponent(p)}
-function kind(n){if(IMG.test(n))return"i";if(VID.test(n))return"v";if(AUD.test(n))return"a";if(TXT.test(n))return"t";return"o"}
-function icon(n){if(IMG.test(n))return"🖼️";if(VID.test(n))return"🎬";if(AUD.test(n))return"🎵";if(TXT.test(n))return"📄";return"📦"}
+function kind(n){if(IMG.test(n))return"i";if(VID.test(n))return"v";if(AUD.test(n))return"a";if(PDF.test(n))return"p";if(EPB.test(n))return"e";if(WEBV.test(n))return"w";if(TXT.test(n))return"t";return"o"}
+function icon(n){if(IMG.test(n))return"🖼️";if(VID.test(n))return"🎬";if(AUD.test(n))return"🎵";if(PDF.test(n))return"📕";if(EPB.test(n))return"📖";if(WEBV.test(n))return"🌐";if(TXT.test(n))return"📄";return"📦"}
 function fmt(b){if(b<1024)return b+" B";if(b<1048576)return (b/1024).toFixed(0)+" KB";return (b/1048576).toFixed(1)+" MB"}
 function parent(d){return d.replace(/\/[^/]+\/?$/,"")||"/"}
 function setbc(){var ps=cwd.split("/").filter(Boolean),h="<a onclick=\"ld('/')\">inicio</a>",a="";
@@ -157,7 +164,7 @@ function render(){
  }
  if(!es.length)h+="<div class=muted>Carpeta vacía</div>";
  document.getElementById("list").innerHTML=h;}
-function prim(p,k){if(k==="t")ed(p);else if(k==="a")playAudio(p);else if(k==="o")location.href="/dl?path="+u(p)+"&dl=1";else vw(p,k)}
+function prim(p,k){if(k==="t")ed(p);else if(k==="a")playAudio(p);else if(k==="e")openEpub(p);else if(k==="p"||k==="w")window.open("/dl?path="+u(p),"_blank");else if(k==="o")location.href="/dl?path="+u(p)+"&dl=1";else vw(p,k)}
 function zipCwd(){location.href="/zip?dir="+u(cwd)}
 // --- menu de acciones por archivo (el borrar deja de estar siempre a la vista) ---
 function menu(p,k,name){var h="<div class=h>"+name+"</div>";
@@ -166,6 +173,10 @@ function menu(p,k,name){var h="<div class=h>"+name+"</div>";
  if(k==="i")h+="<button class=it onclick=\"closeSheet();vw('"+ec(p)+"','i')\">👁 Ver</button>";
  if(k==="v")h+="<button class=it onclick=\"closeSheet();vw('"+ec(p)+"','v')\">▶ Reproducir</button>";
  if(k==="a")h+="<button class=it onclick=\"closeSheet();playAudio('"+ec(p)+"')\">🎵 Reproducir</button>";
+ if(k==="p")h+="<button class=it onclick=\"closeSheet();window.open('/dl?path="+u(p)+"','_blank')\">📕 Abrir</button>";
+ if(k==="e")h+="<button class=it onclick=\"closeSheet();openEpub('"+ec(p)+"')\">📖 Leer</button>";
+ if(k==="w"||k==="o")h+="<button class=it onclick=\"closeSheet();window.open('/dl?path="+u(p)+"','_blank')\">🌐 Abrir en el navegador</button>";
+ if(k==="w")h+="<button class=it onclick=\"closeSheet();ed('"+ec(p)+"')\">✏️ Editar</button>";
  if(k==="t")h+="<button class=it onclick=\"closeSheet();ed('"+ec(p)+"')\">✏️ Editar</button>";
  if(k!=="d")h+="<a class=it href=\"/dl?path="+u(p)+"&dl=1\" onclick=\"closeSheet()\">⬇ Descargar</a>";
  h+="<button class='it d' onclick=\"closeSheet();rm('"+ec(p)+"',"+(k==="d"?1:0)+")\">🗑️ Borrar</button>";
@@ -192,6 +203,25 @@ function cv(){var vc=document.getElementById("vc");g_isImg=false;arrows();vc.inn
 function playAudio(p){var a=document.getElementById("pau");a.src="/dl?path="+u(p);
  document.getElementById("ptt").textContent="🎵 "+p.split("/").pop();document.getElementById("player").classList.add("on");a.play()}
 function pstop(){var a=document.getElementById("pau");a.pause();a.removeAttribute("src");a.load();document.getElementById("player").classList.remove("on")}
+// --- lector EPUB (epub.js + jszip servidos desde /lib de la SD; funciona tambien sin internet) ---
+var g_epbook=null,g_eprend=null;
+function loadJS(src){return new Promise(function(res,rej){
+ if(document.querySelector("script[data-s='"+src+"']"))return res();
+ var s=document.createElement("script");s.src=src;s.dataset.s=src;s.onload=res;s.onerror=function(){rej(src)};document.head.appendChild(s)})}
+function openEpub(p){var ov=document.getElementById("epov"),ar=document.getElementById("eparea");
+ document.getElementById("eptt").textContent="📖 "+p.split("/").pop();
+ ar.innerHTML="<div class=muted>Cargando lector…</div>";ov.style.display="flex";busy(true);
+ loadJS("/dl?path="+u("/lib/jszip.min.js")).then(function(){return loadJS("/dl?path="+u("/lib/epub.min.js"))}).then(function(){
+  ar.innerHTML="";
+  g_epbook=ePub("/dl?path="+u(p),{openAs:"epub"});   // la URL no acaba en .epub: forzamos el tipo
+  g_eprend=g_epbook.renderTo("eparea",{width:"100%",height:"100%",flow:"paginated",spread:"none"});
+  return g_eprend.display();
+ }).then(function(){busy(false)}).catch(function(e){busy(false);
+  ar.innerHTML="<div class=muted style='padding:24px'>No encuentro el lector EPUB.<br><br>Copia <b>jszip.min.js</b> y <b>epub.min.js</b> en una carpeta <b>/lib</b> de la microSD (vienen en la carpeta <i>tools/sdcard/lib</i> del proyecto).<br><br><small>"+e+"</small></div>"})}
+function epClose(){document.getElementById("epov").style.display="none";document.getElementById("eparea").innerHTML="";
+ if(g_eprend){try{g_eprend.destroy()}catch(e){}}if(g_epbook){try{g_epbook.destroy()}catch(e){}}g_eprend=g_epbook=null}
+function epPrev(){if(g_eprend)g_eprend.prev()}
+function epNext(){if(g_eprend)g_eprend.next()}
 function theme(){document.body.classList.toggle("light");var l=document.body.classList.contains("light");
  try{localStorage.setItem("pcTheme",l?"l":"d")}catch(e){}document.getElementById("thb").textContent=l?"☀️":"🌙"}
 // --- editor de texto / JSON crudo ---
@@ -253,8 +283,14 @@ function cfgClose(){document.getElementById("cfg").style.display="none"}
  var sx=0,vc=document.getElementById("vc");
  vc.addEventListener("touchstart",function(e){sx=e.changedTouches[0].clientX},{passive:true});
  vc.addEventListener("touchend",function(e){var dx=e.changedTouches[0].clientX-sx;if(g_isImg&&Math.abs(dx)>40)navImg(dx<0?1:-1)},{passive:true});
- document.addEventListener("keydown",function(e){if(document.getElementById("vwr").style.display!=="flex")return;
+ document.addEventListener("keydown",function(e){
+  if(document.getElementById("epov").style.display==="flex"){
+   if(e.key==="ArrowLeft")epPrev();else if(e.key==="ArrowRight")epNext();else if(e.key==="Escape")epClose();return}
+  if(document.getElementById("vwr").style.display!=="flex")return;
   if(e.key==="ArrowLeft")navImg(-1);else if(e.key==="ArrowRight")navImg(1);else if(e.key==="Escape")cv()});
+ var ex=0,ea=document.getElementById("eparea");
+ ea.addEventListener("touchstart",function(e){ex=e.changedTouches[0].clientX},{passive:true});
+ ea.addEventListener("touchend",function(e){var dx=e.changedTouches[0].clientX-ex;if(Math.abs(dx)>40)(dx<0?epNext:epPrev)()},{passive:true});
 })();
 ld("/");
 </script></body></html>

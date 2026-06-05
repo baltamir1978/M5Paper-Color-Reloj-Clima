@@ -7,8 +7,10 @@
  *    2 CARRUSEL: fotos de la microSD a pantalla completa
  *    3 MUSICA  : reproductor MP3/M4A de la SD (controles tipo iPod Shuffle)
  *    4 LIBRO   : lector de TXT (lista de /Libros, recuerda la pagina de cada uno)
- *    5 WIFI    : (arranca apagado; UP enciende/DOWN apaga) AP propio + QR + gestor web de la SD
- *               (navegar/subir/bajar/editar/borrar + galeria + video ligero con HTTP Range/206)
+ *    5 WIFI    : (arranca apagado; UP enciende/DOWN apaga) une a tu red (IP+QR) o AP propio + QR;
+ *               gestor web de la SD: navegar (lista/detalles/miniaturas), subir/bajar/editar/borrar,
+ *               ZIP de carpeta, fotos (swipe), video y musica (HTTP Range/206), PDF (visor del
+ *               navegador) y EPUB (lector integrado con libs en /lib de la SD).
  *  Modo oculto: G1 doble-click = TV-B-Gone (IR), feedback con el LED RGB.
  *
  *  TODA la configuracion va en /config.json de la microSD (ver ejemplo en el
@@ -307,7 +309,13 @@ void loadImageList(const char* dirpath) {
 bool initSD() {
   SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
   // max_files=10: la descarga ZIP recursiva abre un handle por nivel de carpeta (por defecto solo 5).
-  if (!SD.begin(SD_CS_PIN, SPI, 20000000, "/sd", 10)) { Serial.println("microSD no detectada."); return false; }
+  // Reloj SPI: probamos 40 MHz (lectura ~2x para web/musica/video); si la tarjeta o las pistas no
+  // aguantan, repliega a 20 MHz (estable). Si vieras lecturas corruptas, baja SD_FREQ_HZ a 20000000.
+  const uint32_t SD_FREQ_HZ = 40000000;
+  if (!SD.begin(SD_CS_PIN, SPI, SD_FREQ_HZ, "/sd", 10)) {
+    Serial.println("microSD: 40 MHz fallo, reintentando a 20 MHz...");
+    if (!SD.begin(SD_CS_PIN, SPI, 20000000, "/sd", 10)) { Serial.println("microSD no detectada."); return false; }
+  }
   Serial.println("microSD montada.");
   return true;
 }
@@ -1421,8 +1429,13 @@ static String webContentType(const String& p) {
   if (n.endsWith(".wav")) return "audio/wav";
   if (n.endsWith(".flac")) return "audio/flac";
   if (n.endsWith(".ogg") || n.endsWith(".oga")) return "audio/ogg";
+  if (n.endsWith(".pdf"))  return "application/pdf";          // visor nativo del navegador
+  if (n.endsWith(".epub")) return "application/epub+zip";     // lo lee el lector epub.js
+  if (n.endsWith(".svg"))  return "image/svg+xml";            // el navegador lo dibuja
+  if (n.endsWith(".html") || n.endsWith(".htm")) return "text/html; charset=utf-8";  // el navegador lo renderiza
+  if (n.endsWith(".js"))   return "application/javascript; charset=utf-8";  // para <script> (lector EPUB en /lib)
   if (n.endsWith(".txt")||n.endsWith(".json")||n.endsWith(".csv")||n.endsWith(".md")||n.endsWith(".log")||
-      n.endsWith(".cfg")||n.endsWith(".ino")||n.endsWith(".h")||n.endsWith(".c")||n.endsWith(".js")||n.endsWith(".xml"))
+      n.endsWith(".cfg")||n.endsWith(".ino")||n.endsWith(".h")||n.endsWith(".c")||n.endsWith(".xml"))
     return "text/plain; charset=utf-8";
   return "application/octet-stream";
 }
@@ -1459,10 +1472,15 @@ void handleDl() {
   if (!f || f.isDirectory()) { if (f) f.close(); g_server.send(404, "text/plain", "no existe"); return; }
   size_t fileSize = f.size();
   String type = webContentType(path);
+  bool isMedia = type.startsWith("audio/") || type.startsWith("video/");
 
   if (g_server.hasArg("dl")) {
     String base = path; int sl = base.lastIndexOf('/'); if (sl >= 0) base = base.substring(sl + 1);
     g_server.sendHeader("Content-Disposition", "attachment; filename=\"" + base + "\"");
+  } else if (type.startsWith("image/")) {
+    // Caché del navegador para imagenes: al reentrar a una carpeta NO se vuelve a pedir nada al
+    // dispositivo (clave con carpetas de cientos/miles de fotos; evita la sensacion de bloqueo).
+    g_server.sendHeader("Cache-Control", "public, max-age=604800");   // 7 dias
   }
   g_server.sendHeader("Accept-Ranges", "bytes");
 
@@ -1480,9 +1498,15 @@ void handleDl() {
       if (endByte >= startByte + (2 * 1024 * 1024)) endByte = startByte + (2 * 1024 * 1024) - 1;  // 2 MB/respuesta
       partial = (fileSize > 0 && startByte <= endByte && startByte < fileSize);
     }
+  } else if (isMedia && fileSize > 0 && !g_server.hasArg("dl")) {
+    // Audio/video SIN cabecera Range: respondemos igualmente 206 con el primer trozo. Asi el navegador
+    // ve que admitimos Range y reproduce en streaming desde ya, en vez de descargar el fichero entero
+    // antes de empezar (era la causa de los 30-40 s para arrancar la musica).
+    endByte = (fileSize - 1 >= 2 * 1024 * 1024) ? (2 * 1024 * 1024 - 1) : fileSize - 1;
+    partial = true;
   }
 
-  static uint8_t buf[8192];
+  static uint8_t buf[32768];
   if (partial) {
     size_t len = endByte - startByte + 1;
     f.seek(startByte);
@@ -1517,6 +1541,9 @@ void handleThumb() {
   String serve = SD.exists(tp) ? tp : path;
   File f = SD.open(serve, FILE_READ);
   if (!f || f.isDirectory()) { if (f) f.close(); g_server.send(404, "text/plain", "no"); return; }
+  // Caché agresiva: las miniaturas casi nunca cambian. Reentrar a una carpeta de 1000 fotos se
+  // sirve desde el navegador sin pedir nada (si regeneras miniaturas, recarga con Ctrl+F5).
+  g_server.sendHeader("Cache-Control", "public, max-age=604800");   // 7 dias
   g_server.streamFile(f, webContentType(serve));
   f.close();
 }

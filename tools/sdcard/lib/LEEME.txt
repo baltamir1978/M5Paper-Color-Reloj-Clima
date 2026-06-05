@@ -1,0 +1,20 @@
+Lector de EPUB para el gestor web del M5Paper Color
+====================================================
+
+Copia ESTA carpeta "lib" (con jszip.min.js y epub.min.js) a la RAIZ de la
+microSD, de modo que en la tarjeta quede:
+
+    /lib/jszip.min.js
+    /lib/epub.min.js
+
+Con eso, al pulsar un .epub en el gestor web se abre un lector a pantalla
+completa. Funciona tambien en modo AP (sin internet), porque el lector se
+sirve desde la propia SD.
+
+- Pasar pagina: flechas del teclado, botones "Anterior/Siguiente", o desliza
+  el dedo en el movil.
+- Cerrar: boton "Cerrar" o tecla Esc.
+
+Los PDF no necesitan nada: se abren con el visor propio del navegador.
+
+(jszip 3.10.1 y epub.js 0.3.93)

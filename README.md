@@ -19,15 +19,16 @@
 ## ✨ Características
 
 - 🌦️ **Clima** — temperatura/humedad interior (SHT40) + **predicción AEMET** de varias localidades
-  (hoy destacado: icono a color, máx/mín, **sensación térmica**, **viento + racha**, **índice UV**,
-  lluvia y humedad + 3 días) + **observación en tiempo real** de una estación AEMET.
+  (hoy destacado: icono a color, máx/mín, **viento + racha**, **índice UV**, **previsión por horas**,
+  lluvia y humedad + 3 días) + **observación en tiempo real** de una estación AEMET. La última
+  predicción se **guarda en la SD** y se ve al instante al encender, aunque no haya WiFi.
   Vista **LOCAL** con fecha, reloj grande y batería.
 - 🖼️ **Carrusel de fotos** — imágenes de la microSD a pantalla completa, con **auto-rotación del
   panel** según la orientación de cada foto.
 - 🎵 **Música** — reproductor desde la SD (**MP3 / M4A / FLAC / WAV / AAC**) con el códec ES8311.
   Títulos con acentos correctos (fuente propia).
 - 📖 **Libro** — lector de **TXT** desde `/Libros` con selector de archivos y memoria de página por libro (otros formatos: mejor descargarlos desde el gestor web).
-- 📶 **WiFi** — **gestor web de la microSD** con login: se **une a tu red** (muestra la IP) o crea su **AP propio** con **QR**. Navegar (lista/detalles/miniaturas), subir, editar, borrar, **descargar carpeta en ZIP**, ver fotos (proporción real, swipe), **vídeo ligero** y **mini‑reproductor de música**. Tema claro/oscuro y editor de `config.json` por formulario.
+- 📶 **WiFi** — **gestor web de la microSD** con login: se **une a tu red** (muestra la IP) o crea su **AP propio** con **QR**. Navegar (lista/detalles/miniaturas), subir, editar, borrar, **descargar carpeta en ZIP**, ver fotos (proporción real, swipe), **vídeo ligero**, **mini‑reproductor de música**, abrir **PDF** (visor del navegador) y **EPUB** (lector integrado), y abrir en el navegador cualquier formato que sepa mostrar (SVG, HTML…). Tema claro/oscuro y editor de `config.json` por formulario.
 - ⚙️ **Modos configurables** — activa/desactiva cualquier modo desde `config.json`; los desactivados se saltan.
 - 📺 **TV-B-Gone (modo oculto)** — apaga televisores por IR (108 códigos europeos).
 - 🕒 Hora por **NTP** mantenida en el **RTC**, con horario de verano automático.
@@ -68,10 +69,15 @@ Formatea en **FAT32** y crea esta estructura en la raíz:
 /config.json        ← configuración
 /Fotos/             ← imágenes del carrusel  (.jpg .jpeg .png .bmp)
 /Musica/            ← canciones  (.mp3 .m4a .flac .wav .aac)
-/Libros/            ← libros (.txt en UTF-8)
+/Libros/            ← libros (.txt en UTF-8; PDF/EPUB se leen desde el gestor web)
 /fonts/title.vlw    ← fuente con acentos para los títulos
 /fonts/body.vlw     ← fuente con acentos para el lector de libros
+/lib/               ← (opcional) lector EPUB para la web: jszip.min.js + epub.min.js
 ```
+
+> 📖 Para **leer EPUB** en el gestor web, copia la carpeta [`tools/sdcard/lib`](tools/sdcard/lib)
+> (trae `jszip.min.js` y `epub.min.js`) a la raíz de la SD como `/lib/`. Así el lector funciona
+> **también en modo AP, sin internet**. Los **PDF** no necesitan nada (los abre el propio navegador).
 
 ### `config.json`
 
@@ -236,6 +242,16 @@ hay un botón **⬅ .. atrás**. La carpeta se puede ver en **lista / detalles /
   mucho más rápida; los vídeos muestran un fotograma). Si no hay, cae a la imagen original.
 - **Vídeo**: reproducción en el navegador con **Range (HTTP 206)** → permite avanzar (necesario en iOS).
 - **Música**: **mini‑reproductor** en una barra inferior que **sigue sonando mientras navegas**.
+- **Documentos**: los **PDF** se abren en pestaña con el **visor nativo** del navegador; los **EPUB**
+  con un **lector integrado** a pantalla completa (pasa página con flechas, botones o *swipe*; necesita
+  `/lib/` en la SD, ver arriba). Otros formatos que el navegador sepa dibujar (SVG, HTML…) también se
+  **abren en el navegador**; el resto se descargan.
+
+> ⚡ **Miniaturas y carga.** Las miniaturas e imágenes se sirven con **caché del navegador** (7 días):
+> al **reentrar** a una carpeta (aunque tenga **cientos/miles de fotos**) ya no se piden al equipo, así
+> que es instantáneo. La primera vez, las miniaturas se cargan **bajo demanda** según haces scroll.
+> Como el servidor web es de **un solo hilo**, si cortas una descarga grande a la mitad puede tardar un
+> par de segundos en quedar libre. (Si regeneras las miniaturas, fuerza recarga con **Ctrl/⌘+F5**.)
 
 **Descargar carpeta.** El botón **⬇ Carpeta (ZIP)** (o el menú ⋯ de una carpeta) descarga **toda la
 carpeta en un ZIP** (sin compresión, en streaming; incluye subcarpetas).
@@ -281,6 +297,20 @@ Con la conexión activa no entra en reposo. El AP/STA y la web se configuran en 
 | IR / LED RGB | IR=**48** · LED=**21** |
 
 > La microSD, el e-paper y el códec se alimentan del rail **L3B** del PMIC; el firmware habilita el LDO al arrancar.
+
+### ⚙️ Velocidad de la microSD (SPI a 40 MHz)
+
+La microSD va por **SPI** (no SDIO) compartiendo bus con el e-paper. El firmware la monta a **40 MHz**
+(≈2× de caudal frente a 20 MHz: ayuda a la música, al vídeo y al gestor web) y, **si fallara el montaje,
+repliega solo a 20 MHz**. Si usaras una tarjeta o un cableado que a 40 MHz dé **lecturas corruptas o
+errores intermitentes**, baja la constante:
+
+```cpp
+// M5PaperColor_Reloj.ino, función initSD()
+const uint32_t SD_FREQ_HZ = 40000000;   // ← ponlo en 20000000 si tu tarjeta no es estable a 40 MHz
+```
+
+> El caudal real sigue limitado por SPI: aun a 40 MHz, el vídeo va bien con **clips ligeros** (no HD).
 
 ---
 
@@ -354,10 +384,15 @@ pio device monitor  # monitor serie
 - [x] Modo WiFi: se une a tu red (muestra IP) o crea AP propio; gestor web con login
 - [x] Web: fotos (proporción real + swipe), vídeo (Range/206), tema claro-oscuro, config por formulario
 - [x] Web: vista **lista / detalles / miniaturas**, **mini-reproductor de música** y **descarga de carpeta en ZIP**
+- [x] Web: **PDF** (visor del navegador) y **EPUB** (lector integrado, libs en `/lib` de la SD)
+- [x] Web: **caché de miniaturas/imágenes** (reentrar a carpetas grandes es instantáneo)
+- [x] microSD a **40 MHz** (con repliegue a 20 MHz) para más caudal de música/vídeo/web
 - [ ] Alarma RTC para encender a una hora programada
+- [ ] Servidor web asíncrono (cancelar descargas grandes sin esperas; solo si hace falta)
 
-> 📖 **EPUB descartado:** es más útil **descargar** los libros desde el gestor web que visualizarlos en
-> la pantalla a color (refresco lento). El lector integrado se queda en **TXT**.
+> 📖 **EPUB:** el lector **en pantalla** se queda en **TXT** (el refresco a color es lento para pasar
+> páginas). El **EPUB se lee desde el gestor web** (lector integrado), que es más cómodo; en la pantalla
+> del equipo, mejor TXT.
 
 > ℹ️ **Sobre los refrescos:** el e-paper a color (Spectra 6) solo hace **refrescos completos**
 > (no admite refresco parcial de una región como los e-paper monocromos). Por eso la estrategia es
