@@ -429,13 +429,21 @@ void showBusy(const char* msg) {
 }
 
 // ============================ AEMET ============================
-// GET con reintentos ante el 429 (AEMET limita las peticiones): espera y reintenta re-abriendo.
+// GET ante el limite de AEMET (50 peticiones/min/clave -> HTTP 429). Politica recomendada por AEMET:
+// max 2 REINTENTOS con backoff exponencial; si la respuesta trae 'Retry-After', se respeta (es lo fiable).
 int aemetGET(HTTPClient& h, WiFiClientSecure& c, const String& url) {
-  for (int t = 0; t < 3; t++) {
-    if (t > 0) { h.end(); delay(2000 * t); h.begin(c, url); }   // backoff 2s, 4s
+  static const char* hk[] = { "Retry-After" };
+  for (int t = 0; t < 3; t++) {                 // 1 intento + 2 reintentos
+    if (t > 0) { h.end(); h.begin(c, url); }
+    h.collectHeaders(hk, 1);
     int code = h.GET();
     if (code != 429) return code;
-    Serial.printf("AEMET 429 (reintento %d)...\n", t + 1);
+    if (t >= 2) break;                          // ya agotados los reintentos: no esperar de mas
+    long ra = h.hasHeader("Retry-After") ? h.header("Retry-After").toInt() : 0;
+    long waitS = (ra > 0) ? (ra < 30 ? ra : 30) // honra Retry-After (cap 30s)
+                          : (t == 0 ? 4 : 12);  // si no viene: backoff exponencial 4s, 12s
+    Serial.printf("AEMET 429 (reintento %d, espera %lds)...\n", t + 1, waitS);
+    delay(waitS * 1000);
   }
   return 429;
 }
@@ -688,10 +696,12 @@ void fetchWeatherData(bool withNtp) {
   if (g_apiKey.length() > 0) {
     for (int i = 0; i < numLocs(); i++) {   // sin refrescos por ciudad (el e-paper es lento)
       Serial.printf("Descargando %s...\n", g_locs[i].name.c_str());
-      aemetFetch(i);       delay(600);
-      aemetFetchObs(i);    delay(600);
+      // AEMET limita a 50 peticiones/min/clave; recomienda >=2s entre llamadas. Espaciamos cada
+      // endpoint 2s (el 2o GET de cada uno es una URL de descarga firmada, sin clave, no cuenta).
+      aemetFetch(i);       delay(2000);
+      aemetFetchObs(i);    delay(2000);
       aemetFetchHoraria(i);
-      if (i < numLocs() - 1) delay(1200);   // respiro entre ciudades: AEMET limita peticiones rapidas (HTTP 429)
+      if (i < numLocs() - 1) delay(2000);
     }
     saveClima();   // persiste lo descargado (incluye la hora de actualizacion AEMET de cada ciudad)
   }
